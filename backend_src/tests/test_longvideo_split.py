@@ -173,17 +173,29 @@ def test_prompt():
     print("C 段提示词")
     p = L.plan_segments(SAMPLE, SAMPLE_SECONDS)
     sp = L.build_segment_prompt(p, p.segments[0])
-    check("带段号", "【长视频第 1/%d 段" % len(p.segments) in sp)
-    check("带全片总长", "全片约 %d 秒" % p.covered_seconds in sp)
+    # 段号/跨段指代会诱使 muse.ai 进入「协作对话」模式、回一段文字方案而不是
+    # 生成视频（2026-10-03 实测 3 条长视频任务全部 0 段失败）。详见
+    # longvideo.build_segment_prompt 的 docstring。
+    check("不含段号措辞", "长视频第" not in sp and "第 1/%d 段" % len(p.segments) not in sp)
+    check("不含跨段指代", "其它段" not in sp and "其他段" not in sp)
+    check("以生成指令开头", sp.startswith("全新文生视频创作"))
+    check("声明禁止参考历史上下文", "严禁参考任何历史" in sp)
+    check("写死本段时长", "时长严格为 %d 秒" % p.segments[0].seconds in sp)
+    check("结尾要求直接生成", "不要输出文字方案" in sp)
     check("带基底", p.base[:20] in sp)
     check("未超字数上限", len(sp) <= L.BASE_MAX_CHARS, "%d 字" % len(sp))
     check("每段都带基底", all(p.base[:20] in L.build_segment_prompt(p, s)
+                          for s in p.segments))
+    check("每段都无段号", all("长视频第" not in L.build_segment_prompt(p, s)
                           for s in p.segments))
 
     # 超长剧本也必须压回上限
     big = L.plan_segments(SAMPLE * 40, SAMPLE_SECONDS)
     longest = max(len(L.build_segment_prompt(big, s)) for s in big.segments)
     check("超长剧本也压回上限", longest <= L.BASE_MAX_CHARS, "%d 字" % longest)
+    # 截断必须留痕，不能静默丢剧情
+    check("截断时写入 notes", any("截断" in n for n in big.notes),
+          str(big.notes[:2]))
 
 
 # --------------------------------------------------------------------------

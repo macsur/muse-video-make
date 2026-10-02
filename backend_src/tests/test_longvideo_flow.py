@@ -126,8 +126,12 @@ def scenario_ok(module):
     check("合成信息写进 result", (t.get("result") or {}).get("merge", {}).get("ok") is True)
     check("每段请求时长都是原生档位",
           all(s["requested_duration"] in (5, 10, 30) for s in t["segments"]))
-    check("每段提示词都带段号",
-          all("【长视频第" in p for p in calls))
+    # 段号措辞会诱使 muse.ai 进入对话模式（见 longvideo.build_segment_prompt
+    # 的 docstring 与 HANDOVER-OUT §4.3），所以这里反过来断言**不含**段号。
+    check("每段提示词都不含段号措辞",
+          all("长视频第" not in p for p in calls))
+    check("每段提示词都是生成指令",
+          all(p.startswith("全新文生视频创作") for p in calls))
     check("合成文件名不含分隔符", "/" not in (t["result"]["filename"]))
     module.SCHED.run_sync = real_run_sync
 

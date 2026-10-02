@@ -520,25 +520,63 @@ def plan_segments(prompt: str, requested_duration: int,
 
 
 def build_segment_prompt(plan: SegmentPlan, seg: Segment) -> str:
-    """组装单段的实际提示词：段头定位 + 角色基底 + 段体。"""
-    n = len(plan.segments)
-    head = "【长视频第 %d/%d 段 · 本段约 %d 秒 · 全片约 %d 秒】" % (
-        seg.index, n, seg.seconds, plan.covered_seconds or plan.total_seconds)
-    head += "\n这是同一部长片的一段，必须与其它段保持人物、服装、场景、光线与画风完全一致；" \
-            "请只演绎本段内容，不要试图一次拍完全片。"
+    """组装单段的实际提示词：生成指令 + 角色基底 + 段体。
 
+    措辞是踩过坑换来的，别再改回"第 N/M 段"那种写法。
+
+    背景（2026-10-03 实测）：最早段头写成
+        【长视频第 2/10 段 · 本段约 24 秒 · 全片约 240 秒】
+        这是同一部长片的一段，必须与其它段保持人物、服装、场景、光线与画风完全一致；
+    结果 3 条长视频任务全部 0 段失败，错误统一是「模型未生成媒体，仅返回文本」，
+    模型的回复是「第 2/10 段的内容发我我就接着拍」这种**协作对话**语气。
+
+    两个原因叠加：
+      1. 段号是**对话语义**。模型读到"第 2 段"，合理推断第 1 段已经聊过了，
+         于是反问要内容 —— 它在跟你对话，不是在生成视频。
+      2. "必须与其它段保持一致"**主动提示了还有别的段**，让模型认为这是个
+         多轮协作任务；而干净会话里它根本没看过其它段，产生认知矛盾。
+
+    engine.reset_thread() 每次生成都会导航到干净的 /thread/new，上下文不会跨段
+    累积 —— 所以问题出在提示词本身，不是会话历史。已确认。
+
+    现在的写法对齐短视频的 build_video_prompt（app.py）：以生成指令开头、
+    明确声明"全新生成、禁止参考历史上下文"、时长写死、段体放最后。
+    跨段一致性改由角色基底承载 —— 基底本身就是"全片统一设定"，
+    它是**规格**而不是**对话指代**，模型会当作渲染依据而非上下文引用。
+    """
+    secs = seg.seconds
+    # 不要出现「第 N 段」「共 M 段」「与其它段保持一致」这类措辞。
+    head = ("全新文生视频创作（纯文本全新生成，严禁参考任何历史图片、"
+            "历史对话或上下文）：生成一个视频（时长严格为 %d 秒）。" % secs)
     chunks = [head]
     if plan.base:
-        chunks.append("【全片统一的角色与风格设定】\n" + plan.base)
+        chunks.append("【本片统一的角色与画风设定】\n" + plan.base)
     chunks.append(seg.text)
+    chunks.append("以上是本段的完整创作需求，请直接开始生成这个视频，"
+                  "不要输出文字方案、分镜说明或制作计划。")
 
     out = "\n\n".join(c for c in chunks if c and c.strip()).strip()
     if len(out) > BASE_MAX_CHARS:
-        # 段体优先保留（它才是这一段要拍的东西），基底其次被压缩
-        keep = BASE_MAX_CHARS - len(head) - 32
+        # 段体优先保留（它才是这一段要拍的东西），基底其次被压缩。
+        # 段尾被截掉是**静默丢剧情**，必须像基底那样留痕（notes 会带到前端），
+        # 否则用户看到的成品缺了一段却毫无提示，比报错更难排查。
+        tail = ("\n\n以上是本段的完整创作需求，请直接开始生成这个视频，"
+                "不要输出文字方案、分镜说明或制作计划。")
+        keep = BASE_MAX_CHARS - len(head) - len(tail) - 32
         b_len = min(len(plan.base), max(0, keep // 3))
-        out = head + "\n\n【全片统一的角色与风格设定】\n" + plan.base[:b_len] \
-            + "\n\n" + seg.text[: max(0, keep - b_len)]
+        out = (head + "\n\n【本片统一的角色与画风设定】\n" + plan.base[:b_len]
+               + "\n\n" + seg.text[: max(0, keep - b_len)] + tail)
+        dropped = len(seg.text) - max(0, keep - b_len)
+        if dropped > 0:
+            note = "第 %d 段剧本超出单段长度上限，已截断约 %d 字，该段剧情可能不完整" % (
+                seg.index, dropped)
+            if note not in plan.notes:
+                plan.notes.append(note)
+            if len(plan.base) > b_len:
+                bnote = "第 %d 段的角色基底已压缩（原 %d 字 → %d 字），一致性可能下降" % (
+                    seg.index, len(plan.base), b_len)
+                if bnote not in plan.notes:
+                    plan.notes.append(bnote)
     return out
 
 
