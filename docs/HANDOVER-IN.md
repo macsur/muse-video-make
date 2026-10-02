@@ -89,10 +89,11 @@ pkill -f "remote-debugging-port=19210"
 | # | 事项 | 落点 | 验收标准 |
 |---|---|---|---|
 | B1 | CORS 收紧 | `app.py:72` 真正使用 `CFG.cors_origins`，或按 `public_base` 推导 | 局域网其他机器无法访问管理接口 |
-| B2 | 排队超时与长视频 | `app.py:93` `queue_timeout` / `run_timeout` 随 `duration` 动态计算 | 提交 480s 视频，前方有排队任务时**不会被判 timeout** |
+| B2 | ~~排队超时与长视频~~ | ✅ **已完成**（2026-10-02）：`duration>30` 改走 `longvideo.plan_segments` 自动分段，逐段独立排队 | 见 `HANDOVER-OUT.md` §10 |
 | B3 | `/v1/media` 鉴权 | `app.py:1824` | 无 Key 取媒体返回 401；前端播放路径同步适配 |
 | B4 | 启动健康检查增强 | `run_local.py:431` | 浏览器起不来时启动横幅能明确报错，而不是只有"后端就绪" |
 | B5 | CDP 端口可配 | `run_local.py:42` + CLI 参数 | `--cdp-port 19220` 生效 |
+| B6 | ~~修 `MUSE2API_REPO` 地址~~ | ✅ **已完成**（2026-10-02，原 A5） | 已改为 `czg86389-hub/muse2api` |
 
 ### 🟢 第三批：功能（**这一批请用户提需求**）
 
@@ -116,8 +117,17 @@ pkill -f "remote-debugging-port=19210"
 ```bash
 cd /Users/ttnk/Desktop/muse-video-installer
 .venv_local/bin/python -c "import ast,sys
-for f in ['run_local.py','backend_src/app.py','backend_src/engine.py','backend_src/scheduler.py','backend_src/store.py','backend_src/cdp.py','backend_src/config.py']:
+for f in ['run_local.py','backend_src/app.py','backend_src/engine.py','backend_src/scheduler.py','backend_src/store.py','backend_src/cdp.py','backend_src/config.py','backend_src/longvideo.py']:
     ast.parse(open(f,encoding='utf-8').read()); print('OK',f)"
+```
+
+### 5.1b 长视频专项（全部离线，零额度）
+
+```bash
+cd /Users/ttnk/Desktop/muse-video-installer
+.venv_local/bin/python backend_src/tests/test_longvideo_split.py   # 54 项：分切/基底/装箱/合成降级
+.venv_local/bin/python backend_src/tests/test_longvideo_flow.py    # 54 项：driver 编排，猴补 _run_generation
+node web/tests/showtask.test.js                                     # 19 项：前端渲染，需 node
 ```
 
 ### 5.2 上游已有的测试

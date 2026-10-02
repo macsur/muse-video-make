@@ -19,13 +19,13 @@
 | **本目录来源** | `yys9253462-gif/muse-video-installer` | 服务器一键安装器（本目录就是它，`install.sh` 104KB、`test-install.sh` 30KB 都在） |
 | **真正的服务端** | `czg86389-hub/muse2api` | `backend_src/` 的内容，`install.sh` 就是把它装到服务器上的 |
 
-⚠️ **`run_local.py:37` 写错了仓库地址**：
+⚠️ **`run_local.py:37` 写错了仓库地址**（**已于 2026-10-02 修复**）：
 
 ```python
 MUSE2API_REPO = "yys9253462-gif/muse2api"   # ← 这个仓库不存在
 ```
 
-正确应为 `czg86389-hub/muse2api`。目前因为 `backend_src/app.py` 已存在，`ensure_backend_source()` 直接 return，所以没暴露；但**删掉 `backend_src/` 重新拉源码就会失败**。这是接手后应修的第一处。
+正确应为 `czg86389-hub/muse2api`。原先因为 `backend_src/app.py` 已存在，`ensure_backend_source()` 直接 return，所以没暴露；但删掉 `backend_src/` 重新拉源码就会失败。
 
 ---
 
@@ -181,8 +181,8 @@ PID 21773  Chrome --headless=new --remote-debugging-port=19210  16:07 起 · PPI
 | P2-1 | `MUSE2API_REPO` 仓库地址写错 | `run_local.py:37` |
 | P2-2 | `allow_origins=["*"]` 硬编码，`CFG.cors_origins` 形同虚设；孤儿实例又绑 `0.0.0.0`，管理页对局域网裸奔 | `app.py:72` |
 | P2-3 | `/v1/media/{name}` 无鉴权（本地可接受，但 Key 泄露时视频全裸） | `app.py:1824` |
-| P2-4 | 长视频（120s/240s/480s）容易撞 `queue_timeout=900s` 排队超时 | `app.py:93` |
-| P2-5 | `_condense_video_script` 在 `dur>=30` 时直接返回原文不压缩（实测压缩版只出 10s），长剧本会超长 | `app.py:842` |
+| P2-4 | ~~长视频（120s/240s/480s）容易撞 `queue_timeout=900s` 排队超时~~ **已修**：改走自动分段，逐段独立排队 | `app.py:93` |
+| P2-5 | ~~`_condense_video_script` 在 `dur>=30` 时直接返回原文不压缩~~ **已修**：长剧本先由 `longvideo.plan_segments` 切段，每段独立构造提示词 | `app.py:842` |
 | P2-6 | `run_local.py` 无 `--cdp-port` 参数，CDP 端口硬编码 19210 | `run_local.py:42` |
 | P2-7 | 启动健康检查只探 `/v1/models`，探不出"浏览器起不来" | `run_local.py:431` |
 | P2-8 | `media/Backs/` 里有手工救援的素材（`rescued_video.mp4`、`extracted_frame0.jpg`、`tang_xiansheng_30s.mp4`），是人工调试痕迹，会被 `/admin/media` 列出来 | `backend_src/data/media/Backs/` |
@@ -249,3 +249,59 @@ python3 run_local.py --import-account # 导 muse.ai 账号
 - **没有运行过任何生成任务**（只读了数据文件和日志）
 - **没有清理 P0-1 的孤儿进程**（未获授权，未动现场）
 - `web/index.html` 里的 `[Local Auto-Init]` 注入块是历史遗留产物，本记录未改动它
+
+---
+
+## 10. 后续变更（2026-10-02 晚，接手后已完成）
+
+交班后第一件事是修「长视频必然失败」这条主线，三个 commit：
+
+| commit | 内容 |
+|---|---|
+| `8178fd3` | 新增 `backend_src/longvideo.py`（分切 + 合成）与 `tests/test_longvideo_split.py` |
+| `5049c19` | `app.py` 接入分段编排；修 deadline 守卫吞掉真实错误；`config.py` 加 7 个可调项 |
+| `bf4b04a` | 前端分段展示 + `admin.html` 徽章 + ffmpeg 探测 + 修 `MUSE2API_REPO` |
+
+**核心结论：muse.ai 网页端单次最多只能出 30 秒**（ffprobe 扫过全部历史产出：
+5/10/30 秒，720x1280）。原来的 `_VIDEO_DURATIONS` 白名单是 app 自己编的。
+现在 `duration > 30` 会自动拆成多个 <=30s 的短片依次生成，再用 ffmpeg 合成。
+
+### 新增文件
+
+| 文件 | 作用 |
+|---|---|
+| `backend_src/longvideo.py` | 分切（角色基底提取 / 三级解析 / DP 装箱）+ ffmpeg 合成。**纯逻辑，不 import app/store/engine** |
+| `backend_src/tests/test_longvideo_split.py` | 54 项断言，离线零额度 |
+| `backend_src/tests/test_longvideo_flow.py` | 54 项断言，编排层，猴补 `_run_generation` |
+| `web/tests/showtask.test.js` | 19 项断言，前端渲染（需 node，零依赖） |
+
+### 改动的既有文件
+
+`app.py`（时长白名单双档化 / `create_video` 分段分支 / `_drive_long_video` /
+`get_video` stalled 阈值 / `_startup` 清理 video 残留 / `build_video_prompt` 新参数）、
+`config.py`（7 个 `MUSE2API_*`）、`web/index.html`、`backend_src/admin.html`、
+`backend_src/Dockerfile`、`run_local.py`。
+
+### 接手前必读的新增不变量
+
+1. **driver 绝不能作为 SCHED job 提交**。`_drive_long_video` 用
+   `threading.Thread` + 逐段 `SCHED.run_sync`，段间释放浏览器。
+   若整条长视频占着一个 job，10 段会独占 `GEN_LOCK` 33~62 分钟，
+   把 chat/image/短视频全堵死。
+2. **driver 也不能写成 await 链**。`run_sync` 是阻塞的，写成 await 会卡死
+   FastAPI 事件循环。
+3. **ffmpeg 列表必须写临时文件**。本机 ffmpeg 9.0.1 的 `-i -` 会被解析成 `fd:`
+   协议，`pipe:0` 被协议白名单拦，加 `-protocol_whitelist` 也不行。
+4. **合成片名不能含 `/`**。`app.get_media` 显式拒绝含分隔符的名字。
+5. **合成失败不算任务失败**。段落都生成成功了就是成功，只把原因写进
+   `result.merge.reason`，由前端渲染分段列表。
+6. `get_video` 的 stalled 阈值对长视频是 `seg_queue_timeout + 180`，
+   不是 120 秒 —— 单段实测就要 371 秒。
+
+### 尚未验证的部分
+
+**只做了离线验证，一次都没真的调用过 muse.ai 分段生成。**
+`test_longvideo_flow.py` 猴补掉了 `_run_generation`，ffmpeg 合成只用历史
+视频验证过（10s+10s→20s 快路径、1280x720+720x1280→720x1280 稳路径）。
+真实端到端（duration=240 跑完 10 段）**会消耗大量额度**，
+且预计耗时 33~62 分钟，需要用户授权后再做。
