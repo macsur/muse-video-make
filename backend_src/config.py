@@ -134,6 +134,13 @@ class Config:
     # 长视频整体预算（秒）。单个 30 秒视频实测 371 秒，16 段约 99 分钟，留余量取 2 小时。
     long_video_budget: int = field(
         default_factory=lambda: int(_env("MUSE2API_LONG_VIDEO_BUDGET", "7200")))
+    # 长视频每一段在 _run_generation 自带的 2 次之外，额外重试几次。
+    # 为什么不靠 _run_generation 内部的 2 次就够：那一层失败就整段作废，
+    # 10 段的任务任何一段挂掉都前功尽弃。单次尝试成功率按 70% 估，
+    # 每段 2 次 → 0.91^10 ≈ 39%；每段 3 次 → 0.973^10 ≈ 76%。
+    # 代价只是失败时多花一次单段的时间（约 6 分钟），换来的是能自动跑完。
+    long_video_segment_retries: int = field(
+        default_factory=lambda: int(_env("MUSE2API_LONG_VIDEO_SEG_RETRIES", "1")))
     # 长视频每段的排队上限。分段任务逐段提交，段与段之间要释放浏览器，
     # 所以不能用单段视频的 video_timeout 当排队上限。
     seg_queue_timeout: int = field(

@@ -299,9 +299,62 @@ def test_merge_degrade():
               not [x for x in os.listdir(tempfile.gettempdir()) if x.startswith("merge_")][:1])
 
 
+def test_merge_trim():
+    """按剧本秒数逐段裁剪：muse.ai 只给 5/10/30 秒，不裁成片就会膨胀。
+
+    真实样本（唐先生 240 秒分镜）：10 段原生输出合计 300 秒，
+    剧本分配合计 240 秒 —— 差的那 60 秒必须裁掉，否则节奏全乱。
+    """
+    print("G2 合成裁剪")
+    if not (L._which("ffmpeg") and L._which("ffprobe")):
+        print("  SKIP 未找到 ffmpeg/ffprobe")
+        return
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        # 3 段，每段原生 10 秒（模拟向上取整到原生档位）
+        paths = []
+        for i in range(3):
+            p = os.path.join(td, "s%d.mp4" % i)
+            rc = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 "testsrc=size=320x568:rate=24", "-t", "10",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt",
+                 "yuv420p", p]).returncode
+            if rc != 0 or not os.path.isfile(p):
+                check("生成测试片段", False, "ffmpeg 失败")
+                return
+            paths.append(p)
+
+        total_in = sum(L._probe(p, "ffprobe")["duration"] for p in paths)
+        check("输入合计 30 秒", abs(total_in - 30) < 0.5, "%.2f" % total_in)
+
+        wants = [8, 7, 5]
+        out = os.path.join(td, "m.mp4")
+        r = L.merge_segments(paths, out_path=out, durations=wants)
+        check("裁剪合成成功", r.get("ok") is True, str(r.get("reason")))
+        if r.get("ok"):
+            got = L._probe(out, "ffprobe")["duration"]
+            check("成片裁到剧本总长 20 秒", abs(got - 20) < 1.0, "%.2f" % got)
+            check("标记走了裁剪", r.get("trimmed") is True, str(r.get("trimmed")))
+
+        # durations 与实际一致 → 不该触发裁剪，快路径保持 -c copy
+        same = [10, 10, 10]
+        r2 = L.merge_segments(paths, out_path=os.path.join(td, "m2.mp4"),
+                              durations=same)
+        check("时长已吻合时不裁剪", r2.get("ok") and r2.get("trimmed") is False,
+              str(r2.get("trimmed")))
+        check("时长已吻合时走 copy 快路径", r2.get("mode") == "copy", str(r2.get("mode")))
+
+        # durations 长度对不上 → 忽略裁剪，绝不串位
+        r3 = L.merge_segments(paths, out_path=os.path.join(td, "m3.mp4"),
+                              durations=[8, 7])
+        check("durations 数量不符时安全忽略",
+              r3.get("ok") and r3.get("trimmed") is False, str(r3.get("reason")))
+
+
 def main():
     for fn in (test_split, test_base, test_prompt, test_plain, test_short_script,
-               test_edges, test_pack, test_merge_degrade):
+               test_edges, test_pack, test_merge_degrade, test_merge_trim):
         fn()
     print()
     if _failures:

@@ -137,14 +137,18 @@ def scenario_ok(module):
 
 
 def scenario_fail(module):
-    """第 3 段失败 → 任务 failed，但前 2 段必须保留。"""
-    print("场景 2：第 3 段失败")
+    """第 3 段**持续**失败（重试也没救回来）→ 任务 failed，但前 2 段必须保留。
+
+    注意 fixture 要让第 3 段的每一次尝试都失败：如果只失败一次，
+    段级重试会把它救回来，任务反而成功，就测不到「中断并保留」这条路径了。
+    """
+    print("场景 2：第 3 段持续失败")
     media = _fixture_media(module, 12)
     calls = []
 
     def generation(prompt, kind, timeout, **kw):
         calls.append(prompt)
-        if len(calls) == 3:
+        if len(calls) in (3, 4):  # 第 3 段的首次尝试 + 1 次重试
             raise module.MuseGenerationError("fixture: 等待生成超时，未出现新的生成结果")
         return media[len(calls) - 1], "fixture-account"
 
@@ -160,10 +164,43 @@ def scenario_fail(module):
     check("错误里说明保留了几段", "已完成 2/" in (t.get("error") or ""), str(t.get("error")))
     check("已完成分段被保留", len(t.get("segments") or []) == 2,
           "%d 段" % len(t.get("segments") or []))
-    check("只调了 3 次生成（失败即中断）", len(calls) == 3, "%d 次" % len(calls))
+    check("重试 1 次后仍失败即中断（共 4 次）", len(calls) == 4, "%d 次" % len(calls))
     check("失败时不合成（result 为空）", not (t.get("result") or {}).get("merge"),
           str(t.get("result")))
     check("进度单调不减", _monotonic(seen), str(seen))
+
+
+def scenario_retry(module):
+    """瞬时失败（只失败一次）→ 段级重试救回来，任务照常成功。
+
+    这是 10 段长视频能「自动一次跑完」的关键：muse.ai 的生成 agent 本来就有
+    相当比例的抖动，2026-10-03 实测同一时刻紧接着再发一次就正常出片。
+    """
+    print("场景 2b：瞬时失败被重试救回")
+    media = _fixture_media(module, 12)
+    calls = []
+
+    def generation(prompt, kind, timeout, **kw):
+        calls.append(prompt)
+        if len(calls) == 3:  # 只有第 3 段首次尝试失败
+            raise module.MuseGenerationError("fixture: 瞬时抖动")
+        return media[min(len(calls), len(media)) - 1], "fixture-account"
+
+    module._run_generation = generation
+    merge_path = os.path.join(module.CFG.media_dir, "merged_retry.mp4")
+    module.merge_segments = lambda paths, **kw: {
+        "ok": True, "path": merge_path, "mode": "copy", "seconds": SAMPLE_SECONDS}
+    Path(merge_path).write_bytes(b"x" * 128)
+
+    req = module.VideoRequest(prompt=SAMPLE, duration=SAMPLE_SECONDS)
+    r = asyncio.run(module.create_video(req, None))
+    t, _ = _wait_terminal(module, r["id"])
+    check("重试后任务成功", t.get("status") == module.ST_DONE, str(t.get("error")))
+    check("总调用次数 = 段数 + 1 次重试", len(calls) == t.get("segment_total") + 1,
+          "%d 次 vs %d 段" % (len(calls), t.get("segment_total")))
+    check("分段数不受重试影响", len(t.get("segments") or []) == t.get("segment_total"))
+    check("notes 里留了重试痕迹",
+          any("重试" in n for n in (t.get("notes") or [])), str(t.get("notes")))
 
 
 def scenario_merge_degrade(module):
@@ -260,6 +297,7 @@ def main():
             scenario_deadline_error(module)
             scenario_ok(module)
             scenario_fail(module)
+            scenario_retry(module)
             scenario_merge_degrade(module)
             scenario_short(module)
             scenario_startup(module)

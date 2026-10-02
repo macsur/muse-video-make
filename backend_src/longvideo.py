@@ -648,9 +648,15 @@ def _listfile(path: str, paths: List[str]) -> None:
             f.write("file '%s'\n" % os.path.abspath(p).replace("'", "'\\''"))
 
 
+# 合成时判定「需要裁剪」的容差（秒）。muse.ai 的原生档位只有 5/10/30，
+# 而剧本分配的段长是任意整数，两者对不上的地方要裁回来。
+_TRIM_TOL = 0.75
+
+
 def merge_segments(paths: List[str], out_path: str = "",
                    ffmpeg: str = "", ffprobe: str = "",
-                   work_dir: str = "") -> dict:
+                   work_dir: str = "", durations: Optional[List[float]] = None
+                   ) -> dict:
     """把多段视频合成一条。
 
     **任何失败都只返回 ``{"ok": False, "reason": ...}``，绝不抛异常** ——
@@ -660,6 +666,11 @@ def merge_segments(paths: List[str], out_path: str = "",
     * 快路径：编码参数一致 → ``-c copy``（实测历史产出 100% 是 720x1280 h264
       yuv420p 24fps，必然命中）
     * 稳路径：逐段 ``scale+pad+setsar=1+fps+format`` 归一化后再 concat
+
+    ``durations`` 是剧本给每段分配的秒数（与 ``paths`` 一一对应）。
+    **muse.ai 只会输出 5/10/30 秒**，而剧本分配的段长是任意整数，``_snap_duration``
+    只能向上取整 —— 不裁剪的话，13 秒的镜头会拿到 30 秒画面，成片从 240 秒
+    膨胀到 300 秒，节奏全乱。所以这里按剧本时长逐段 ``-t`` 裁回去。
     """
     paths = [p for p in (paths or []) if p and os.path.isfile(p)]
     if len(paths) < 2:
@@ -691,8 +702,32 @@ def merge_segments(paths: List[str], out_path: str = "",
                 return {"ok": False, "reason": "分段文件无法被 ffprobe 解析"}
             total_in = sum(i["duration"] for i in usable)
 
+            # ---- 剧本分配的每段秒数 → 需要裁剪的段 ----
+            # 按下标对齐 paths，这样某段 ffprobe 失败时也不会串位。
+            want_by_idx = {}
+            if durations and len(durations) == len(paths):
+                for i, w in enumerate(durations):
+                    try:
+                        w = float(w)
+                    except (TypeError, ValueError):
+                        continue
+                    if w > 0:
+                        want_by_idx[i] = w
+
+            def _trim_to(i):
+                """该段需要的裁剪时长（秒）；不需要裁剪返回 None。"""
+                w = want_by_idx.get(i)
+                if w is None or infos[i] is None:
+                    return None
+                return w if abs(infos[i]["duration"] - w) > _TRIM_TOL else None
+
+            need_trim = any(_trim_to(i) is not None for i in range(len(paths)))
+
             # ---- 快路径：参数一致，直接拼 ----
-            if len(usable) == len(paths) and all(_same_stream(usable[0], i) for i in usable) \
+            # 需要裁剪时不能走 -c copy：裁过的段参数已经和原始段不一致了。
+            if not need_trim \
+                    and len(usable) == len(paths) \
+                    and all(_same_stream(usable[0], i) for i in usable) \
                     and all(p.lower().endswith((".mp4", ".mov", ".m4v")) for p in paths):
                 lf = os.path.join(tmp, "fast.txt")
                 _listfile(lf, paths)
@@ -701,6 +736,7 @@ def merge_segments(paths: List[str], out_path: str = "",
                 if rc == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
                     final = _probe(out_path, fp)
                     return {"ok": True, "path": out_path, "mode": "copy",
+                            "trimmed": False,
                             "seconds": (final or {}).get("duration", total_in)}
 
             # ---- 稳路径：先归一化，再拼 ----
@@ -711,9 +747,14 @@ def merge_segments(paths: List[str], out_path: str = "",
                 vf = ("scale=%d:%d:force_original_aspect_ratio=decrease,"
                       "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,format=yuv420p"
                       % (ref["w"], ref["h"], ref["w"], ref["h"]))
-                rc, log = _run([ff, "-y", "-i", p, "-vf", vf, "-c:v", "libx264",
-                                "-preset", "veryfast", "-crf", "23", "-pix_fmt",
-                                "yuv420p", "-an", dst], timeout=1800)
+                args = [ff, "-y", "-i", p, "-vf", vf]
+                w = _trim_to(i)
+                if w is not None:
+                    # -t 是输出选项：放在输入之后、输出文件之前，只裁这一段。
+                    args += ["-t", "%.3f" % w]
+                args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                         "-pix_fmt", "yuv420p", "-an", dst]
+                rc, log = _run(args, timeout=1800)
                 if rc != 0 or not os.path.isfile(dst):
                     return {"ok": False, "reason": "第 %d 段归一化失败：%s"
                             % (i + 1, log.strip().splitlines()[-1] if log.strip() else "未知错误")}
@@ -729,6 +770,7 @@ def merge_segments(paths: List[str], out_path: str = "",
 
             final = _probe(out_path, fp)
             return {"ok": True, "path": out_path, "mode": "normalize",
+                    "trimmed": need_trim,
                     "seconds": (final or {}).get("duration", total_in)}
     except Exception as e:  # noqa: BLE001 —— 合成失败绝不能打断已完成的任务
         return {"ok": False, "reason": "合成异常：%s" % e}

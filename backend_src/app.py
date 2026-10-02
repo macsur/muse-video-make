@@ -1542,6 +1542,63 @@ def _seg_overall(done: int, total: int, seg_pct: float = 0.0,
     return max(0, min(int(top), int(round(pct))))
 
 
+def _is_quota_fault(exc: Exception) -> bool:
+    """判断是不是「额度用完」类错误 —— 这类重试没有意义，必须立刻停。"""
+    msg = str(exc)
+    return bool(re.search(
+        r"额度|配额|quota|limit reached|weekly limit|"
+        r"reset|过期|expired|没有可用账号",
+        msg, re.I))
+
+
+def _run_segment_with_retry(prompt: str, prog_cb, ref_img, seg, n: int,
+                            task_id: str, deadline: float, notes: list):
+    """跑一段视频，失败后按 config 重试；全部失败才抛出异常。
+
+    为什么要这一层：``_run_generation_locked`` 自带 2 次尝试，但那一层一失败
+    整段就作废，而长视频任一段挂掉整个任务就前功尽弃。10 段的任务对
+    「每段成功率」是指数关系，多一次重试的收益远大于多花的几分钟。
+    """
+    tries = max(1, int(getattr(CFG, "long_video_segment_retries", 1)) + 1)
+    last_exc = None
+
+    for k in range(tries):
+        if k:
+            # 刚失败就立刻重发容易撞上同一个坏状态，隔几秒再试。
+            time.sleep(min(20, 5 * k))
+            log.warning("【长视频 %s】第 %d/%d 段第 %d 次重试（原因：%s）",
+                        task_id[-8:], seg.index, n, k, str(last_exc)[:160])
+            # 重试期间进度回退到本段起点，避免前端一直显示上一段的百分比。
+            store.update_task(task_id, segment_index=seg.index,
+                              segment_done=seg.index - 1, stage="rendering")
+
+        try:
+            res, acc_id = SCHED.run_sync(
+                lambda p=prompt: _run_generation(
+                    p, "video", CFG.video_timeout, on_progress=prog_cb,
+                    reference_image=ref_img),
+                label=f"video:{task_id[-8:]}:seg{seg.index}:try{k + 1}",
+                queue_timeout=CFG.seg_queue_timeout)
+            if k:
+                note = f"第 {seg.index} 段重试 {k} 次后才成功"
+                if note not in notes:
+                    notes.append(note)
+            return res, acc_id
+        except Exception as exc:  # noqa: BLE001 —— 交给上层统一记失败
+            last_exc = exc
+            if _is_quota_fault(exc):
+                log.error("【长视频 %s】第 %d 段遇到额度/账号故障，不再重试：%s",
+                          task_id[-8:], seg.index, str(exc)[:160])
+                break
+            # 预算快用完了就别再试，直接如实报错。
+            if k + 1 < tries and time.time() > deadline - 30:
+                log.error("【长视频 %s】第 %d 段失败且预算将尽，放弃重试：%s",
+                          task_id[-8:], seg.index, str(exc)[:160])
+                break
+
+    raise last_exc
+
+
 def _drive_long_video(task_id: str, plan, req: VideoRequest,
                       ref_img: str | None, budget: int) -> None:
     """长视频驱动：逐段提交生成，段间释放浏览器，最后尝试合成。
@@ -1590,12 +1647,8 @@ def _drive_long_video(task_id: str, plan, req: VideoRequest,
                 store.update_task(task_id, progress=_seg_overall(_d, n, p),
                                   segment_index=_i, stage="rendering")
 
-            res, acc_id = SCHED.run_sync(
-                lambda p=prompt: _run_generation(
-                    p, "video", CFG.video_timeout, on_progress=prog_cb,
-                    reference_image=ref_img),
-                label=f"video:{task_id[-8:]}:seg{seg.index}",
-                queue_timeout=CFG.seg_queue_timeout)
+            res, acc_id = _run_segment_with_retry(
+                prompt, prog_cb, ref_img, seg, n, task_id, deadline, notes)
 
             entry = {"index": seg.index, "t_start": seg.t_start, "t_end": seg.t_end,
                      "seconds": seg.seconds, "requested_duration": seg.request_duration,
@@ -1628,7 +1681,10 @@ def _drive_long_video(task_id: str, plan, req: VideoRequest,
         merge = merge_segments(
             [e["path"] for e in done],
             out_path=os.path.join(CFG.media_dir, "merged_%s.mp4" % task_id),
-            ffmpeg=CFG.ffmpeg, ffprobe=CFG.ffprobe)
+            ffmpeg=CFG.ffmpeg, ffprobe=CFG.ffprobe,
+            # 按剧本分配的秒数逐段裁回：muse.ai 只有 5/10/30 秒原生档位，
+            # 不裁的话成片会从 240 秒膨胀到 300 秒，节奏全乱。
+            durations=[e["seconds"] for e in done])
 
     elapsed = round(time.time() - t0, 1)
     if merge.get("ok"):
@@ -1642,6 +1698,7 @@ def _drive_long_video(task_id: str, plan, req: VideoRequest,
                                   "bytes": os.path.getsize(merge["path"]),
                                   "kind": "video",
                                   "merge": {"ok": True, "mode": merge.get("mode"),
+                                            "trimmed": merge.get("trimmed"),
                                             "seconds": merge.get("seconds")},
                                   "segments": done, "notes": notes})
     else:
