@@ -38,7 +38,7 @@ import time
 import uuid
 import zipfile
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
@@ -65,14 +65,38 @@ app = FastAPI(title="muse2api", version="1.5.3")
 # Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
 # 浏览器扩展从 chrome-extension:// 发起，也一并放行。
 #
-# 这里直接放行所有来源：本服务用 Bearer Key 鉴权、不依赖 Cookie，
-# 放行来源不会带来越权风险；反之如果把来源限死，浏览器端的智能体
-# （Open WebUI / LobeChat / 各种 Web 客户端）会被 CORS 拦住用不了。
+# 上游原本在这里硬编码 allow_origins=["*"]，理由是「本服务用 Bearer Key 鉴权、
+# 不依赖 Cookie，放行来源不会带来越权风险」，同时兼容 Open WebUI / LobeChat 等
+# 各类 Web 客户端。这个理由在服务器部署下成立。
+#
+# 但本地版不成立，有两个叠加因素：
+#   1. run_local 过去把前端静态服务绑在 0.0.0.0，同一局域网内谁都能打开前端；
+#   2. API Key 被 prepare_web_index 明文注入 web/index.html。
+# 在「0.0.0.0 + 明文 Key」的前提下放开所有来源，等于把账号额度暴露给整个局域网，
+# 所以本地模式改为白名单：显式列出允许的前端来源（含本地 web 端口）。
+#
+# 注意：本地前端 (127.0.0.1:8090) 与 API (127.0.0.1:18610) 是**不同端口**，
+# 属于跨源请求，所以本地 web 源必须显式放行，否则会把自己给拦住。
 _origins = [o.strip() for o in (CFG.cors_origins or "").split(",") if o.strip()]
+if CFG.local_mode:
+    # 本地前端由 run_local 起在另一个端口（默认 8090），与 API 跨源，
+    # 必须显式放行，否则会把自己的前端也拦掉。run_local 注入 MUSE2API_WEB_PORT。
+    try:
+        _web_port = int(os.environ.get("MUSE2API_WEB_PORT", "0")) or None
+    except ValueError:
+        _web_port = None
+    _local_origins = {"http://127.0.0.1:%d" % CFG.port, "http://localhost:%d" % CFG.port}
+    if _web_port:
+        _local_origins.add("http://127.0.0.1:%d" % _web_port)
+        _local_origins.add("http://localhost:%d" % _web_port)
+    _origins = sorted(set(_origins) | _local_origins)
+else:
+    _origins = ["*"]
+
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
 app.add_middleware(CORSMiddleware,
-                   allow_origins=["*"],
+                   allow_origins=_origins,
                    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
                    allow_headers=["*"],
                    expose_headers=["*"],
@@ -1026,9 +1050,16 @@ def media_url(name: str) -> str:
     配了 public_base 就返回**绝对 URL** —— OpenAI 兼容客户端（以及各类智能体
     平台）拿到 data[].url 后一般会直接渲染或下载，相对路径会被解析到客户端
     自己的域名上，导致 404。public_base 为空时退回相对路径。
+
+    本地模式下附带 `?key=`：媒体接口是要鉴权的，而浏览器 `<video src>` /
+    `<img src>` 无法附加 Authorization 头，只能走查询参数。不带的话前端一播放
+    就是 401。服务端部署（local_mode 关闭）时不带 key，由客户端自己用 Bearer。
     """
     base = _public_base()
-    return f"{base}/v1/media/{name}" if base else f"/v1/media/{name}"
+    url = f"{base}/v1/media/{name}" if base else f"/v1/media/{name}"
+    if CFG.local_mode and CFG.api_key:
+        url += f"?key={CFG.api_key}"
+    return url
 
 
 # ------------------------- cookie 解析 -------------------------
@@ -2050,9 +2081,23 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
 
 @app.get("/v1/media/{name}")
-def get_media(name: str):
+def get_media(name: str, key: str | None = Query(default=None),
+              authorization: str | None = Header(default=None)):
+    """取已生成的媒体文件。
+
+    需要鉴权：媒体目录里放的是账号额度换来的成品，Key 一旦泄露就等于全部裸奔。
+
+    两种带凭证的方式：
+      * 标准做法 —— `Authorization: Bearer <key>`（OpenAI 兼容客户端用这个）
+      * 兜底 —— `?key=<key>` 查询参数。浏览器的 `<video src=...>` / `<img src=...>`
+        没法附加请求头，只能走查询参数。前端播放路径依赖这个。
+    """
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
+    # 复用统一鉴权逻辑，但把查询参数里的 key 视作 Bearer 凭证
+    if key and not (authorization or "").lower().startswith("bearer "):
+        authorization = f"Bearer {key}"
+    auth(authorization)
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
         raise HTTPException(404, "文件不存在")
@@ -2284,14 +2329,43 @@ def get_apikey(_=Depends(auth)):
 
 @app.post("/admin/apikey/rotate")
 def rotate_apikey(_=Depends(auth)):
-    """生成新的 API Key，写入 .env 并立即生效（不用重启）。"""
+    """生成新的 API Key，写入 .env 并立即生效（不用重启）。
+
+    本地模式下还要写回 data/local_config.json —— 那是 run_local.py 每次启动时
+    读取并用环境变量 MUSE2API_KEY 注入的来源。只写 .env 的话，重启后 Key 会被
+    local_config 里的旧值覆盖回去（这就是「轮换后重启静默回退」的成因）。
+    """
     import secrets
     new_key = "m2a_" + secrets.token_hex(24)
     old = CFG.api_key
     CFG.api_key = new_key
     _persist_env("MUSE2API_KEY", new_key)
+    if CFG.local_mode:
+        _persist_local_config_key(new_key)
     return {"ok": True, "api_key": new_key, "previous": old,
             "message": "已生成新 Key 并立即生效；旧 Key 已失效，请更新下游项目"}
+
+
+def _persist_local_config_key(new_key: str) -> bool:
+    """把新 Key 写回 data/local_config.json（本地模式的 Key 唯一事实来源）。
+
+    local_config.json 在 backend_src/ 的上一级 data/ 下（run_local.py 以
+    BASE_DIR/data 为固定路径）。写失败不致命 —— CFG.api_key 已经生效了，
+    只是下次重启会回退，所以这里如实回报。
+    """
+    path = os.path.join(CFG.base_dir, os.pardir, "data", "local_config.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["api_key"] = new_key
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except (OSError, ValueError) as e:
+        log.warning("写回 local_config.json 失败，重启后 Key 会回退: %s", e)
+        return False
 
 
 def _persist_env(key: str, value: str):
@@ -2725,6 +2799,29 @@ def _ensure_git_repo(token: str = ""):
     _git(["config", "user.email", "czg86389-hub@users.noreply.github.com"])
 
 
+def _reject_upgrade_in_local_mode():
+    """本地模式下拒绝「一键升级」和「推送到上游」。
+
+    这两个接口对服务器部署是有用的，但对本地版是毁灭性的：
+
+      * /admin/update/upgrade 用上游 tarball 覆盖 backend_src/ 下**所有**文件，
+        只保护 .env / data/accounts.json / data/tasks.json 三个。本地版对
+        app.py、longvideo.py 等做了大量魔改（长视频分段等），一次点击全没了，
+        而且 admin.html 上那个按钮没有确认弹窗。
+      * /admin/repo/push 会 git push 到上游 main 分支。本地版不是上游的延续，
+        推上去等于污染别人的仓库。
+
+    两者原本都只用 Depends(auth)（即 Bearer Key）保护，而 Key 明文写在
+    web/index.html 里，所以任何一个知道 Key 的人都能触发。这里在本地模式下
+    直接堵死；要恢复得改 MUSE2API_LOCAL_MODE 并自行评估风险。
+    """
+    if CFG.local_mode:
+        raise HTTPException(
+            403,
+            "本地模式已禁用在线升级与代码推送：它们会覆盖/污染本地对 backend_src/ 的修改。"
+            "如需升级请手动 git 操作。")
+
+
 def _check_update_sync(force: bool = False) -> dict:
     """检测 GitHub 官方仓库 (czg86389-hub/muse2api) 是否有新版本或新提交。
     默认缓存 90 秒，防止频繁刷新触发 GitHub API 速率限制。"""
@@ -2837,6 +2934,8 @@ def _check_update_sync(force: bool = False) -> dict:
         "highlights": highlights,
         "recent_commits": recent_commits,
         "checked_at": int(now),
+        # 本地模式下管理页据此隐藏「一键升级」横幅与按钮（后端也会拒绝该接口）。
+        "local_mode": bool(CFG.local_mode),
     }
     _UPDATE_CACHE["ts"] = now
     _UPDATE_CACHE["data"] = data
@@ -2917,6 +3016,7 @@ async def admin_check_update(force: bool = False):
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
     """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
+    _reject_upgrade_in_local_mode()
     res = await asyncio.to_thread(_upgrade_from_github_sync)
     restart = payload.get("restart", True) if isinstance(payload, dict) else True
     if restart:
@@ -2934,6 +3034,7 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 @app.post("/admin/repo/push")
 async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
+    _reject_upgrade_in_local_mode()
     msg = (payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
     new_token = (payload.get("github_token") or "").strip()
     if new_token:

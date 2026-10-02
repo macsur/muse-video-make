@@ -11,7 +11,12 @@
  */
 const fs=require('fs');
 const h=fs.readFileSync('web/index.html','utf8');
-const body=h.match(/<script>([\s\S]*?)<\/script>/)[1];
+// 取主 IIFE 那个 script 块。注意 index.html 顶部还有一个带 src 的
+// <script src="/local-config.js"></script>（Key 运行时下发，不含内联代码），
+// 所以不能简单取第一个 <script>…</script>，要挑「不带 src 且含 showTask」的那块。
+const blocks=[...h.matchAll(/<script(?![^>]*\ssrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m=>m[1]);
+const body=blocks.find(b=>b.includes('function showTask'));
+if(!body) throw new Error('未找到包含 showTask 的主 script 块');
 
 // 只取 IIFE 内部，暴露 showTask 供断言
 const els={get taskArea(){return globalThis.__els.taskArea;},get taskHint(){return globalThis.__els.taskHint;}};
@@ -26,8 +31,10 @@ globalThis.location={origin:'http://127.0.0.1:8090'};
 const out={};
 const fns={esc:s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
   fmtBytes:n=>n+'B'};
-const src=body.replace(/^\s*\/\/ \[Local Auto-Init\][\s\S]*?$/m,'')
-  .replace('(function () {','(function () { globalThis.__T={showTask,segmentsHtml,$:$,state};');
+// 主 IIFE 里已经不含 [Local Auto-Init] 块（Key 改为运行时 /local-config.js 下发）。
+// 块内开头还有一个独立的 Auto-Init IIFE，所以要锚定主 IIFE 的 'use strict'，
+// 不能替换第一个 "(function () {"（那会插到 Auto-Init 内部，拿不到 showTask）。
+const src=body.replace("'use strict';","'use strict'; globalThis.__T={showTask,segmentsHtml,$:$,state};");
 new Function('$','state','els', src)($,state,els);
 const {showTask,segmentsHtml}=globalThis.__T;
 

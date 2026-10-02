@@ -633,7 +633,7 @@ curl -X POST <span class="s">"BASE/v1/chat/completions"</span> \
   <span class="k">"url"</span>:<span class="s">"http://your-server:18610/v1/media/xxxx.webp"</span>,
   <span class="k">"kind"</span>:<span class="s">"image"</span>,<span class="k">"bytes"</span>:23860}]}
 
-<span class="c"># url 是完整绝对地址，可直接给下游渲染 / 下载；/v1/media/* 无需鉴权。</span>
+<span class="c"># url 是完整绝对地址，可直接给下游渲染 / 下载；本地模式下已自带 ?key= 可直接播放。</span>
 <span class="c"># 想要 base64 就传 "response_format":"b64_json"。</span></pre>
 
       <h4>4. 生视频（curl，异步）</h4>
@@ -688,9 +688,10 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
 
       <h4>7. 鉴权</h4>
       <div class="hint" style="margin:0">
-        除 <code>/healthz</code>、<code>/readyz</code>、<code>/v1/media/*</code> 外，其余接口均需
-        <code>Authorization: Bearer &lt;API Key&gt;</code>。API Key 在服务器
-        <code>/opt/muse2api/.env</code> 的 <code>MUSE2API_KEY</code> 中配置。
+        除 <code>/healthz</code>、<code>/readyz</code> 外，其余接口（含
+        <code>/v1/media/*</code>）均需 <code>Authorization: Bearer &lt;API Key&gt;</code>。
+        浏览器直接播放媒体时可用 <code>?key=&lt;API Key&gt;</code> 查询参数代替请求头。
+        API Key 在服务器 <code>/opt/muse2api/.env</code> 的 <code>MUSE2API_KEY</code> 中配置。
       </div>
 
       <h4>8. 接入各类客户端 / 智能体</h4>
@@ -1382,6 +1383,18 @@ async function loadRepoStatus(force){
       }catch(_){}
     }
     _lastRepoStatus = s;
+    // 本地模式：后端已拒绝 /admin/update/upgrade 与 /admin/repo/push
+    // （它们会覆盖/污染本地对 backend_src/ 的修改）。这里把升级入口一并隐藏，
+    // 免得用户点到只看到一个 403。
+    if (s.local_mode){
+      const lb = $('updateBanner'); if (lb) lb.classList.remove('show');
+      ['btnBannerUpgrade','btnRepoPull','btnRepoTop','repoBadge'].forEach(function(id){
+        const el = $(id); if (el) el.style.display = 'none';
+      });
+      const msg = $('repoStatusDesc');
+      if (msg) msg.innerHTML = '本地模式：已禁用在线升级与代码推送（避免覆盖本地修改）。如需升级请手动 <code>git pull</code>。';
+      return;
+    }
     const badge = $('repoBadge');
     const topBtn = $('btnRepoTop');
     const topTxt = $('repoTopTxt');

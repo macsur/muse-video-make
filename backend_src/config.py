@@ -98,6 +98,16 @@ class Config:
         default_factory=lambda: _env("MUSE2API_CORS_ORIGINS",
                                      "https://muse.ai,https://www.muse.ai"))
 
+    # 本地模式（run_local.py 启动时置 1）。
+    #
+    # 本地版对 backend_src/ 做了大量魔改（长视频分段等），而
+    # /admin/update/upgrade 会用 GitHub 上游 tarball 直接覆盖 backend_src/ 下
+    # 所有文件（只保护 .env / data/accounts.json / data/tasks.json 三个），
+    # /admin/repo/push 则会把本地代码推回上游 main。两者对本地版都是毁灭性的，
+    # 所以本地模式下一律禁用。
+    local_mode: bool = field(
+        default_factory=lambda: _env("MUSE2API_LOCAL_MODE", "0") not in ("0", "", "false", "False"))
+
     # 生成
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))

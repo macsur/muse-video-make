@@ -10,6 +10,7 @@ Muse 视频工作台 · 本地免 Docker 一键运行器
 from __future__ import annotations
 
 import argparse
+import atexit
 import http.server
 import json
 import os
@@ -44,6 +45,10 @@ MUSE2API_REF = "main"
 DEFAULT_API_PORT = 18610
 DEFAULT_WEB_PORT = 8090
 DEFAULT_CDP_PORT = 19210
+
+# 前端静态服务默认只绑回环地址。API Key 会被注入前端页面（见 prepare_web_index），
+# 绑 0.0.0.0 等于把账号额度暴露给整个局域网。需要局域网访问时用 --web-host 指定。
+WEB_BIND_HOST = "127.0.0.1"
 
 # ----------------- 终端颜色 -----------------
 C_RED = "\033[0;31m" if sys.stdout.isatty() else ""
@@ -280,7 +285,16 @@ def ensure_backend_source():
 
 # ----------------- Web 界面更新注入 -----------------
 def prepare_web_index(api_port: int, api_key: str):
-    """确保 web 目录存在并注入配置默认值。"""
+    """确保 web 目录存在，并把配置改成**运行时**拉取，不再把 Key 写进文件。
+
+    旧实现把 API Key 明文注入 index.html（`[Local Auto-Init]` 块），有两个问题：
+      1. Key 永久留在磁盘上 —— 目录被复制/打包/分享就跟着泄露；
+      2. 注入只做一次（有标记保护），Key 轮换后前端永远拿不到新值。
+
+    现在改为：HTML 里只留一个 `<script src="/local-config.js">` 引用，
+    Key 由本地 web 服务在运行时生成（见 start_web_server 的 do_GET）。
+    文件里不再有任何 Key，grep m2a_ 应该是空的。
+    """
     os.makedirs(WEB_DIR, exist_ok=True)
     index_path = os.path.join(WEB_DIR, "index.html")
     if not os.path.isfile(index_path):
@@ -290,40 +304,149 @@ def prepare_web_index(api_port: int, api_key: str):
     with open(index_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    # 保证前端 localStorage 首次加载时自动填入本地端口与 Key
-    inject_script = f"""
-    // [Local Auto-Init]
-    var cfgKey = 'muse_video_cfg';
-    var cur = {{}};
-    try {{ cur = JSON.parse(localStorage.getItem(cfgKey) || '{{}}'); }} catch(e) {{}}
-    if (!cur.base) {{ cur.base = 'http://127.0.0.1:{api_port}'; }}
-    if (!cur.key) {{ cur.key = '{api_key}'; }}
-    localStorage.setItem(cfgKey, JSON.stringify(cur));
-    """
-    if "[Local Auto-Init]" not in html:
-        html = html.replace("<script>", f"<script>\n{inject_script}\n", 1)
-        with open(index_path, "w", encoding="utf-8") as f:
-            f.write(html)
+    # 1) 清掉历史遗留的明文 Key 注入块（可能已在磁盘上）。
+    #    磁盘上有两种历史形态，都见过：
+    #      a) 裸的顶层语句（旧版 prepare_web_index 注入的原始形态）
+    #      b) 包在 IIFE 里的（后来手改过）
+    #    所以结尾只允许匹配「可有可无的 IIFE 闭合」，不能强制要求它存在。
+    #    反过来也不能只删到 setItem 那行 —— 那样会留下残缺的 "}" / "})();"
+    #    让页面直接 SyntaxError。
+    if "[Local Auto-Init]" in html:
+        import re as _re
+        html = _re.sub(
+            r"[ \t]*// \[Local Auto-Init\][\s\S]*?"
+            r"localStorage\.setItem\(cfgKey, JSON\.stringify\(cur\)\);"
+            r"(?:\s*\}\s*)?(?:\s*\)\(\)\s*;?)?",
+            "", html)
+        if "[Local Auto-Init]" in html:
+            log_warn("未能完整清除历史 Key 注入块，请检查 web/index.html")
+        html = html.replace("\n\n\n", "\n\n")
+
+    # 2) 确保引了 /local-config.js（Key 由此运行时下发）
+    if "/local-config.js" not in html:
+        html = html.replace(
+            "<script>",
+            '<script src="/local-config.js"></script>\n<script>', 1)
+
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(html)
 
 
 # ----------------- 静态 Web 服务 -----------------
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
-def start_web_server(port: int, directory: str):
+def start_web_server(port: int, directory: str, host: str = WEB_BIND_HOST,
+                     api_port: int = 18610, api_key: str = ""):
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=directory, **kwargs)
         def log_message(self, format, *args):
             pass # 抑制普通请求日志，保持终端整洁
 
-    httpd = ThreadedHTTPServer(("0.0.0.0", port), Handler)
+        def do_GET(self):
+            # 动态下发本地配置。Key 不写进 index.html —— 之前 prepare_web_index
+            # 会把明文 Key 永久注入 HTML 文件，目录一旦被复制/分享就跟着泄露，
+            # 而且注入只做一次，Key 轮换了前端也不更新。这里改为运行时生成，
+            # 文件里永远没有 Key。
+            if self.path.split("?")[0] == "/local-config.js":
+                body = ("window.__LOCAL_CFG__ = %s;\n" % json.dumps(
+                    {"base": f"http://127.0.0.1:{api_port}", "key": api_key},
+                    ensure_ascii=False)).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            super().do_GET()
+
+    # 只绑回环地址：API Key 曾明文注入前端，绑 0.0.0.0 等于把额度暴露给整个局域网。
+    # 需要局域网访问时用 --web-host 显式指定。
+    httpd = ThreadedHTTPServer((host, port), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     return httpd
 
 
 # ----------------- 启动状态监控与打印 -----------------
+# ----------------- 单实例保护 -----------------
+PIDFILE = os.path.join(DATA_DIR, "run_local.pid")
+
+
+def _read_pidfile() -> int:
+    """读出 pidfile 里的 PID；文件不存在/损坏返回 0。"""
+    try:
+        with open(PIDFILE, encoding="utf-8") as f:
+            return int((f.read().strip() or "0").split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否还活着。os.kill(pid, 0) 只做权限/存在性检查，不真发信号。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 存在但不属于当前用户
+
+
+def ensure_single_instance(cfg: dict):
+    """已有实例在跑就复用它，不要静默起第二个。
+
+    为什么必须要有这个：macOS 允许 0.0.0.0:P 和 127.0.0.1:P 同时绑定，所以
+    第二个 run_local.py 不会报「端口被占用」，而是直接起来。然后：
+
+      * 两个进程共享 backend_src/data/*.json，而 store.py 的锁是**进程内**的，
+        跨进程毫无保护 → 账号池和任务记录互相覆盖；
+      * 两个进程共享同一个 Chrome（engine 检测到 CDP 端口已被占用就直接复用），
+        两边都能下发点击，会串话；
+      * 保活守护跑两份，每 15 分钟各打一次 /api/session。
+
+    之前只在**首次生成配置**时探测端口，配置已存在就直接复用，所以完全拦不住。
+    """
+    # 1) pidfile 命中且进程活着 → 复用
+    old_pid = _read_pidfile()
+    if _pid_alive(old_pid):
+        print(f"\n{C_YEL}检测到已有实例在运行 (PID {old_pid})。{C_OFF}")
+        log_info(f"前端: http://127.0.0.1:{cfg['web_port']}/")
+        log_info(f"管理面板: http://127.0.0.1:{cfg['api_port']}/admin?key={cfg['api_key']}")
+        log_info("本次启动已取消。要强制重启请先在旧终端按 Ctrl+C，或结束该进程。")
+        sys.exit(0)
+
+    # 2) pidfile 过期（进程已死）→ 清掉重写
+    if old_pid:
+        log_info(f"清理残留 pidfile（PID {old_pid} 已不存在）")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PIDFILE, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid()}\n")
+
+    # 3) 没有 pidfile 但端口已被占 —— 多半是别人手动起了后端，或 pidfile 被删了。
+    #    这里必须挡住，否则就是上面那三种串话。
+    for label, port in (("API", cfg["api_port"]), ("Web", cfg["web_port"])):
+        if is_port_in_use(port):
+            log_err(f"{label} 端口 {port} 已被占用，但找不到本程序的 pidfile。")
+            log_warn("可能有另一个 run_local.py 在跑，或后端被手动启动过。")
+            log_info(f"先关掉占用者（lsof -nP -iTCP:{port} -sTCP:LISTEN）再重试；")
+            log_info("若确认无人占用，可删除 " + PIDFILE + " 后重试。")
+            sys.exit(1)
+
+
+def cleanup_pidfile():
+    """退出时清掉自己的 pidfile（只删属于自己的那份）。"""
+    if _read_pidfile() == os.getpid():
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
+
+
 def print_status_banner(cfg: dict, browser_path: str):
     api_port = cfg["api_port"]
     web_port = cfg["web_port"]
@@ -370,6 +493,8 @@ def main():
     parser.add_argument("--import-account", action="store_true", help="启动账号导入工具")
     parser.add_argument("--browser", type=str, help="指定 Chrome/Chromium 浏览器路径")
     parser.add_argument("--open-browser", action="store_true", help="服务启动后自动打开网页")
+    parser.add_argument("--web-host", type=str, default=WEB_BIND_HOST,
+                        help="前端 Web 服务绑定地址 (默认 127.0.0.1；填 0.0.0.0 会暴露给局域网，不推荐)")
     args = parser.parse_args()
 
     cfg = load_or_init_config(args.api_port, args.web_port)
@@ -377,6 +502,10 @@ def main():
     if args.import_account:
         run_import_account(cfg)
         return
+
+    # 单实例保护：必须在起任何服务之前挡掉，否则第二个实例已经造成串话了。
+    ensure_single_instance(cfg)
+    atexit.register(cleanup_pidfile)
 
     print(f"\n{C_BLD}Muse 视频工作台 —— 正在启动本地环境...{C_OFF}")
 
@@ -400,7 +529,8 @@ def main():
 
     # 5. 启动前端 Web 服务
     log_step(f"启动前端 Web 服务 (端口 {cfg['web_port']})")
-    web_server = start_web_server(cfg["web_port"], WEB_DIR)
+    web_server = start_web_server(cfg["web_port"], WEB_DIR, args.web_host,
+                                  cfg["api_port"], cfg["api_key"])
     log_ok("前端服务已启动")
 
     # 6. 配置后端环境变量并启动后端进程
@@ -415,6 +545,13 @@ def main():
     env["MUSE2API_HOME_DIR"] = BASE_DIR
     env["MUSE2API_PROFILE_ROOT"] = os.path.join(DATA_DIR, "profiles")
     env["MUSE2API_PUBLIC_BASE"] = f"http://127.0.0.1:{cfg['api_port']}"
+    # 本地模式标记：后端据此禁用「一键在线升级」和「代码推送到上游」
+    # （前者会用 GitHub tarball 覆盖 backend_src/ 下除 3 个白名单文件外的所有内容，
+    #  本地版的长视频分段等改动会全部丢失；后者会把本地代码推到上游 main）。
+    env["MUSE2API_LOCAL_MODE"] = "1"
+    # 前端端口：后端本地模式下用它把本地前端来源加进 CORS 白名单
+    # （前端 8090 与 API 18610 是不同端口，属于跨源）。
+    env["MUSE2API_WEB_PORT"] = str(cfg["web_port"])
 
     # ffmpeg：长视频分段后要靠它合成。探测不到不算致命 —— 后端会降级成
     # 「只返回分段列表」，但要提前告诉用户，否则他等 40 分钟才发现拿不到合成片。
@@ -486,6 +623,10 @@ def main():
             backend_proc.kill()
         web_server.shutdown()
         log_ok("服务已全部退出，欢迎再次使用！")
+    finally:
+        # 无论正常退出、异常还是 Ctrl+C，都别把 pidfile 留在那里，
+        # 否则下次启动会以为「已有实例」而拒绝运行。
+        cleanup_pidfile()
 
 if __name__ == "__main__":
     main()

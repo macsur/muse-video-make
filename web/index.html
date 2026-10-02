@@ -208,17 +208,8 @@
 </div>
 <div class="toast" id="toast"></div>
 
+<script src="/local-config.js"></script>
 <script>
-
-    // [Local Auto-Init]
-    var cfgKey = 'muse_video_cfg';
-    var cur = {};
-    try { cur = JSON.parse(localStorage.getItem(cfgKey) || '{}'); } catch(e) {}
-    if (!cur.base) { cur.base = 'http://127.0.0.1:18610'; }
-    if (!cur.key) { cur.key = 'm2a_1dcf48aec0a1422a747983c12c10bd9a'; }
-    localStorage.setItem(cfgKey, JSON.stringify(cur));
-    
-
 (function () {
   'use strict';
   var LS_CFG = 'muse_video_cfg', LS_HIST = 'muse_video_hist', POLL_MS = 4000;
