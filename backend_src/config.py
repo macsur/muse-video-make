@@ -128,12 +128,16 @@ class Config:
 
     # 单段内容的秒数上限（硬约束，不建议超过 30）
     video_seg_cap: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_SEG_CAP", "30")))
-    # 段数上限：480 秒 / 30 秒 = 16 段。超出则截断并在任务里明确写明丢了多少内容。
+    # 段数上限。2026-10-03 起默认一段只放一个镜头（见 longvideo.plan_segments
+    # 的实测记录：多镜头一段会让 muse.ai 切进「先规划再分头开工」的对话模式，
+    # 一个附件都不出），所以段数不再由「总时长 / 30」决定，而由镜头数决定：
+    # 480 秒的上限剧本大约 40 个镜头，取 48 留够余量。
     video_max_segments: int = field(
-        default_factory=lambda: int(_env("MUSE2API_VIDEO_MAX_SEGMENTS", "16")))
-    # 长视频整体预算（秒）。单个 30 秒视频实测 371 秒，16 段约 99 分钟，留余量取 2 小时。
+        default_factory=lambda: int(_env("MUSE2API_VIDEO_MAX_SEGMENTS", "48")))
+    # 长视频整体预算（秒）。单段实测约 371 秒，一段一镜头时 24 段 ≈ 148 分钟，
+    # 加上重试取 3.5 小时。
     long_video_budget: int = field(
-        default_factory=lambda: int(_env("MUSE2API_LONG_VIDEO_BUDGET", "7200")))
+        default_factory=lambda: int(_env("MUSE2API_LONG_VIDEO_BUDGET", "12600")))
     # 长视频每一段在 _run_generation 自带的 2 次之外，额外重试几次。
     # 为什么不靠 _run_generation 内部的 2 次就够：那一层失败就整段作废，
     # 10 段的任务任何一段挂掉都前功尽弃。单次尝试成功率按 70% 估，

@@ -98,7 +98,12 @@ def main() -> int:
     src = Path(args.script).read_text(encoding="utf-8")
 
     import longvideo as L
-    plan = L.plan_segments(src, args.duration)
+    try:  # 用真实配置推演，免得预览和服务端实际分段不一致
+        from config import CFG
+        cap, maxseg = CFG.video_seg_cap or L.MUSE_MAX_SINGLE_SECONDS, CFG.video_max_segments
+    except Exception:  # noqa: BLE001 —— 没装依赖时也能看计划
+        cap, maxseg = L.MUSE_MAX_SINGLE_SECONDS, 48
+    plan = L.plan_segments(src, args.duration, cap=cap, max_segments=maxseg)
     show_plan(plan, args.duration, src)
 
     if args.plan_only:

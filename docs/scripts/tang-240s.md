@@ -17,8 +17,8 @@
 #### 【0:00—0:36｜上半场：曾经相信与逐渐疏离】
 
 * **镜头 01 (0:00—0:08) 青年时代练拳**
-* **画面与机位**：清晨薄雾中的旧城区院落，15岁左右年轻时的唐进生（黑发健硕）在击打悬挂沙袋，出拳迅猛、肌肉紧绷。中景至半身特写，50mm 镜头，柔和自然晨光。
-* **English Prompt**: `Cinematic 50mm shot, dawn morning soft light in an old courtyard. A muscular Chinese teenage boy around 15 years old hitting a heavy hanging sandbag with clean, sharp, powerful punches. Defined shoulders and arms, focused expression, gritty realistic texture.`
+* **画面与机位**：清晨薄雾中的旧城区院落，二十岁出头年轻时的唐进生（黑发健硕）在击打悬挂沙袋，出拳迅猛、肌肉紧绷。中景至半身特写，50mm 镜头，柔和自然晨光。
+* **English Prompt**: `Cinematic 50mm shot, dawn morning soft light in an old courtyard. A muscular Chinese young man in his early twenties hitting a heavy hanging sandbag with clean, sharp, powerful punches. Defined shoulders and arms, focused expression, gritty realistic texture.`
 
 
 * **镜头 02 (0:08—0:18) 沉默的家庭晚餐**
@@ -113,7 +113,7 @@
 
 * **镜头 16 (2:38—2:48) 岁月动作匹配剪辑 (Match Cut)**
 * **画面与机位**：【视觉跳切匹配】前一秒：年轻唐进生发力挥出一记重拳；后一秒：现在的唐进生在家中有力利落地披上厚外套，手臂与背部肌肉线条自然拉紧。
-* **English Prompt**: `Visual match cut: First shot of a muscular Chinese teenage boy around 15 years old throwing a powerful punch, seamlessly cut to the 50-year-old mature man firmly swinging a heavy jacket over his broad shoulders at home. Strength preserved.`
+* **English Prompt**: `Visual match cut: First shot of a muscular Chinese young man in his early twenties throwing a powerful punch, seamlessly cut to the 50-year-old mature man firmly swinging a heavy jacket over his broad shoulders at home. Strength preserved.`
 
 
 * **镜头 17 (2:48—3:05) 镜前的凝视**

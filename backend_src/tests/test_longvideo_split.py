@@ -269,6 +269,25 @@ def test_pack():
     bins = L._pack_min_bins(durs, 30)
     check("真实样本 10 段装箱到 10 段", len(bins) == 10, str(bins))
 
+    # max_units=1：一段只放一个镜头。实测依据见 plan_segments 的 docstring ——
+    # 多镜头一段时 muse.ai 经常切进「先规划、再分头开工、稍后交付」的对话模式，
+    # 一个附件都不出。
+    one = L._pack_min_bins([8, 10, 10, 8], 30, max_units=1)
+    check("max_units=1 每段一个", all(len(b) == 1 for b in one), str(one))
+    check("max_units=1 段数=元素数", len(one) == 4, str(one))
+    check("max_units=1 仍保序", [b[0] for b in one] == [0, 1, 2, 3], str(one))
+    check("max_units=0 不限量（向后兼容）",
+          len(L._pack_min_bins([10, 10, 10, 10], 30, max_units=0)) == 2)
+    check("max_units 非法值被夹到 1",
+          all(len(b) == 1 for b in L._pack_min_bins([8, 10], 30, max_units=-5)))
+
+    # 默认就是一段一镜头
+    p = L.plan_segments(SAMPLE, SAMPLE_SECONDS)
+    check("plan_segments 默认一段一镜头",
+          all(len(re.findall(r"镜头\s*\d+|段落\s*[A-Z]", s.text)) == 1
+              for s in p.segments),
+          str([re.findall(r"镜头\s*\d+|段落\s*[A-Z]", s.text) for s in p.segments]))
+
 
 # --------------------------------------------------------------------------
 # G ffmpeg 降级

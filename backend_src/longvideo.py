@@ -365,15 +365,22 @@ def _split_oversize(text: str, seconds: int, cap: int) -> List[Tuple[str, int]]:
     return out
 
 
-def _pack_min_bins(durs: List[int], cap: int) -> List[List[int]]:
+def _pack_min_bins(durs: List[int], cap: int, max_units: int = 0) -> List[List[int]]:
     """保序装箱（DP），使段数最少，且每段总时长 <= cap。返回下标分组。
 
     贪心（能塞就塞）在这里不最优：dur=[10,10,10,10], cap=30 贪心会得到 3 段
     （10+10+10 / 10），DP 得到 2 段。段数直接等于用户要等的生成轮次。
+
+    ``max_units`` > 0 时限制每段最多装几个 unit（= 镜头）。
+    **默认必须传 1**，理由见 plan_segments 的实测记录：一次给 muse.ai 多个
+    镜头，它有相当比例会切进「我先规划/分头开工，稍后交付」的对话模式，
+    一个附件都不出。段数变多换来的是每一段都真的能拍出来。
     """
     n = len(durs)
     if n == 0:
         return []
+    if max_units and max_units < 1:
+        max_units = 1
 
     INF = float("inf")
     f = [0] + [None] * n  # f[i] = 覆盖前 i 个元素所需的最少段数
@@ -381,6 +388,8 @@ def _pack_min_bins(durs: List[int], cap: int) -> List[List[int]]:
     for i in range(1, n + 1):
         total, best, bj = 0, None, -1
         for j in range(i - 1, -1, -1):
+            if max_units and (i - j) > max_units:
+                break
             total += durs[j]
             if total > cap:
                 break
@@ -398,7 +407,7 @@ def _pack_min_bins(durs: List[int], cap: int) -> List[List[int]]:
         # 兜底贪心，宁可多几段也不能不切
         bins, cur, total = [], [], 0
         for i, d in enumerate(durs):
-            if cur and total + d > cap:
+            if cur and (total + d > cap or (max_units and len(cur) >= max_units)):
                 bins.append(cur)
                 cur, total = [], 0
             cur.append(i)
@@ -427,10 +436,20 @@ def _snap_duration(seconds: int) -> int:
 
 def plan_segments(prompt: str, requested_duration: int,
                   cap: int = MUSE_MAX_SINGLE_SECONDS,
-                  max_segments: int = 16) -> SegmentPlan:
+                  max_segments: int = 16,
+                  max_units_per_segment: int = 1) -> SegmentPlan:
     """把长剧本拆成若干 <= ``cap`` 秒的段。
 
     纯函数：同一输入必然得到同一输出（测试依赖这一点）。
+
+    ``max_units_per_segment`` 默认 **1**，即一段只放一个镜头。实测依据
+    （2026-10-03，唐先生 240 秒分镜）：一段塞 2~3 个镜头时，muse.ai 有相当
+    比例会切进规划/对话模式 ——「镜头07…→镜头08…→镜头09…三段纯文本生成，
+    原片都在 clips/ 里」「三个片段正在并行生成中，全部完成后我再拼接成
+    28 秒成片交付」—— 结果一个附件都不出，错误统一是
+    「模型未生成媒体，仅返回文本」。段数从 10 涨到 24 是有代价的
+    （等待时间翻倍），但每段只讲一件事、没有「分头开工再拼接」的可乘之机，
+    才真的拍得出来。
     """
     prompt = (prompt or "").strip()
     plan = SegmentPlan(total_seconds=int(requested_duration or 0))
@@ -440,6 +459,7 @@ def plan_segments(prompt: str, requested_duration: int,
 
     cap = max(1, int(cap))
     max_segments = max(1, int(max_segments))
+    max_units_per_segment = max(1, int(max_units_per_segment or 1))
 
     base_blocks, base_spans = _base_spans(prompt)
     units, lead = _parse_units(prompt, cap)
@@ -479,7 +499,8 @@ def plan_segments(prompt: str, requested_duration: int,
             flat.append((txt, sec, None))
 
     # 2) 保序装箱
-    bins = _pack_min_bins([f[1] for f in flat], cap)
+    bins = _pack_min_bins([f[1] for f in flat], cap,
+                          max_units=max_units_per_segment)
 
     # 3) 截断保护：段数太多就砍掉后面的，并明确告知
     truncated = 0
