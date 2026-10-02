@@ -274,8 +274,19 @@ class MuseEngine:
                     if (!document.querySelector('textarea')) return 'no-ta';
                     var h = document.querySelector('[data-hatch-shell-hydration-state]');
                     if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
-                    var b = document.body ? (document.body.innerText || '') : '';
-                    if (b.indexOf('Connecting...') !== -1) return 'connecting';
+                    // 「正在连接」中英文都要认。旧代码只查英文 'Connecting...'，
+                    // 而这个账号的 muse.ai 界面是中文的 —— 于是页面明明停在
+                    // 「正在连接…」（WebSocket 没连上），却被判成 'ready'，
+                    // 后面所有等待都发生在半加载页面上，附件自然一个都抓不到。
+                    // 2026-10-03 实测两次长视频失败都源于此。
+                    //
+                    // 只看**主对话区**的连接提示：侧栏 thread 历史里可能残留
+                    // 「正在连接」之类的字样，拿 body.innerText 全文去匹配会让
+                    // 这里永远等不到 ready（比原 bug 更糟）。同理 'connecting'
+                    // 必须出现在正文里才算数。
+                    var main_ = document.querySelector('main') || document.body;
+                    var mb = main_ ? (main_.innerText || '') : '';
+                    if (/Connecting\.\.\.|正在连接|连接中/.test(mb)) return 'connecting';
                     return 'ready';
                 })()""")
                 if st == "ready":
@@ -314,8 +325,11 @@ class MuseEngine:
                     : 0;
                 var hasAtts = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length > 0;
                 var hasStop = !!document.querySelector('button[aria-label*="Stop" i]');
-                var bodyTxt = document.body ? (document.body.innerText || '') : '';
-                var hasStuck = bodyTxt.indexOf('Still sending') !== -1 || bodyTxt.indexOf('Connecting...') !== -1;
+                // 卡死/未连上只看主对话区（scope）：侧栏 thread 历史里可能残留
+                // 「正在连接」字样，用 body.innerText 会让 hasStuck 恒为真，
+                // 于是每次都判定需要导航、导航后又永远等不到干净页。
+                var scopeTxt = scope ? (scope.innerText || '') : '';
+                var hasStuck = /Still sending|Connecting\.\.\.|正在连接|连接中/.test(scopeTxt);
                 if (hasStop || hasStuck || hasAtts) return true;
                 if (forChat) {
                     return bubbleCount >= 16;
@@ -752,6 +766,27 @@ class MuseEngine:
             tail = st.get("tail") or ""
             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail):
                 raise MuseGenerationError("账号额度不足")
+            # 页面半加载（WebSocket 掉线/仍在连接）时，附件元素会一直是 0，
+            # 此时「没抓到附件」是**抓取侧的问题**，不是模型没生成。
+            #
+            # 2026-10-03 实测：页面停在「正在连接…」时，_wait_attachment 等满
+            # txt_stable 阈值后抛出「模型未生成媒体，仅返回文本: <上一条回复>」，
+            # 把页面故障伪装成了模型拒答，排查方向被带偏。真实原因是那次
+            # muse.ai 其实已经生成成功了（返回里写着「已生成…720×1280 3.0 秒」）。
+            #
+            # 所以连接不通时要如实报连接故障，不要把「抓不到」说成「没生成」。
+            #
+            # 但**不能一见 Connecting 字样就立刻抛**：正常生成过程中页面偶尔
+            # 也会闪「正在连接」，而且附件可能马上就会出现（test_vm_wait 的桩就是
+            # 这种情形：tail 恒为 Connecting，但 20 秒后附件正常出现）。
+            # 这里只做「已经耗掉大段时间、一个附件都没有、助手气泡也没增长」的
+            # 兜底诊断 —— 到这一步还没任何产出，才更有把握是连接卡死。
+            conn_stuck = re.search(r"Connecting\.\.\.|正在连接|连接中|Loading\.\.\.|加载中", tail)
+            assistant_grew = (st.get("cnt") or 0) > base_agent_cnt
+            if conn_stuck and not atts and not assistant_grew and elapsed > 45.0:
+                raise MuseGenerationError(
+                    "muse.ai 页面长时间停在「正在连接」且无任何产出，判断为页面/WebSocket "
+                    "连接故障（不是模型没生成）。建议重试，或检查账号会话是否有效。")
             # Sidebar/stale connection text does not prove this generation failed.
             # The caller's generation deadline remains the bounded timeout.
             # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件），且并非正在生成媒体的报告
@@ -759,8 +794,24 @@ class MuseEngine:
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                # 检查是否包含媒体文件生成关键词（如 .webp, .png, .mp4, imagine_media 等），若是则说明正在产出媒体，绝不能误判为纯文本拒答
-                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact|视频|搞定了|生成成功|重绘|一帧", cur_txt, re.I))
+                # 检查是否包含媒体文件生成关键词，若是则说明正在产出媒体，绝不能误判为纯文本拒答。
+                #
+                # 「已生成 / 已交付 / 渲染完成」这类词一定要在表里：2026-10-03 实测
+                # muse.ai 在确实生成了视频之后返回的是
+                #   「镜头01 已生成：晨雾旧城院落、年轻黑发健硕的唐进生击打悬挂沙袋，
+                #     出拳连贯。9:16 竖屏 720×1280，实测时长严格 3.0 秒。」
+                # 旧正则只认「视频」「生成成功」，于是把一次**真实的成功生成**
+                # 判成「模型未生成媒体，仅返回文本」——排查方向被带偏了很久。
+                is_media_report = bool(re.search(
+                    r"\.(?:webp|png|jpe?g|mp4|webm)"
+                    r"|imagine_media|deliverable|artifact"
+                    r"|generated\s+.*(?:image|video)|verified\s+generated"
+                    # 中文：既认「生成成功」，也认「已生成/已交付/渲染完成」这类
+                    # 同义表述（模型在成功时更常用后者）。
+                    r"|视频|音频|图片|图像"
+                    r"|搞定了|生成成功|已生成|已交付|已完成|渲染完成|已渲染"
+                    r"|重绘|一帧",
+                    cur_txt, re.I))
                 if not is_media_report:
                     if cur_txt == last_txt:
                         txt_stable += 1
@@ -910,8 +961,8 @@ class MuseEngine:
                     tail = self.page.js("document.body.innerText.slice(-500)") or ""
                 except Exception:
                     tail = ""
-                if "Still sending" in tail or "Connecting..." in tail:
-                    raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+                if re.search(r"Still sending|Connecting\.\.\.|正在连接|连接中", tail):
+                    raise MuseGenerationError("云端 VM 连接超时 (Still sending / 正在连接)")
 
         if not got_first:
             raise MuseGenerationError("等待助手首字响应超时")
