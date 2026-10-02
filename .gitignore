@@ -1,0 +1,23 @@
+# 安装后产生的运行数据，不要提交
+# （无前导斜杠 → 同时命中顶层 data/ 和 backend_src/data/：账号池、任务、媒体、浏览器 profile）
+data/
+install.conf
+*.log
+
+# 密钥：绝对不能进版本库
+backend_src/.env
+.env
+
+# 本地 Python 虚拟环境（run_local.py 自动创建）
+.venv_local/
+venv/
+
+# Python 缓存（跑测试会生成）
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

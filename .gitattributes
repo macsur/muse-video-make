@@ -1,0 +1,7 @@
+# 关键：强制所有文本文件用 LF 换行。
+# 否则 Windows 用户克隆/下载后会得到 CRLF 的 .sh，传到 Linux 执行时
+# 会报 `bash: $'\r': command not found`，整个脚本跑不起来。
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.md text eol=lf
