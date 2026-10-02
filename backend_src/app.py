@@ -1164,13 +1164,25 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
         if deadline is not None and time.monotonic() >= deadline:
             raise _deadline_error(last_exc)
         if attempt > 0:
-            if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
-                break
+            # 原来这里第一句是 `if "未产出媒体附件，仅返回了文本回复" in str(last_exc): break`
+            # —— 那个字符串全仓库已经不存在了（engine 早改成「模型未生成媒体，仅返回文本」），
+            # 所以这句判断是死代码，它想表达的「纯文本回复就别试了」从来没生效过。
+            #
+            # 真正的问题是下面那个 break：备用账号拿不到就整个放弃。本机账号池只有
+            # 1 个号，于是**任何瞬时失败都是一次就死**。而 muse.ai 的生成 agent
+            # 本来就有相当比例的抖动 —— 它会改成聊天口径，编一句
+            # 「成品实测：720×1280、严格 30.000000 秒」然后在页面上留下一个
+            # aria-label="找不到视频" 的占位（thread 5274edb7 现场）。
+            # 实测同一时刻紧接着再发一次就正常出片（task_de396808040f47d99c54，5s，71.9s）。
+            # 所以：没备用号就用同一个号重试一次，别直接放弃。
             alt = store.pick_account(rotate=True, force_rotate=True, exclude_id=cur_acc["id"])
-            if not alt or alt["id"] == cur_acc["id"]:
-                break
-            cur_acc = alt
-            log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
+            if alt and alt["id"] != cur_acc["id"]:
+                cur_acc = alt
+                log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
+            else:
+                log.warning("【生成重试】账号池无备用账号，用当前账号 %s 重试一次（原因：%s）",
+                            cur_acc.get("label"), str(last_exc)[:120])
+                time.sleep(3)
         try:
             refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
             if refreshed:

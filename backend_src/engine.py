@@ -442,21 +442,24 @@ class MuseEngine:
         p = self.page
         time.sleep(1)
 
-        # 1) 点左下角 Settings 按钮（aria-label=Settings）
-        raw = p.js(self._CLICK_JS % json.dumps('button[aria-label="Settings"]'))
+        # 1) 点左下角 Settings 按钮。muse.ai 前端已本地化，aria-label 现在是
+        #    「设置」而不是 "Settings"，只认英文会让 quota() 直接抛「找不到按钮」。
+        raw = p.js(self._CLICK_JS % json.dumps(
+            'button[aria-label="Settings"],button[aria-label="设置"]'))
         if not raw:
             raise MuseGenerationError("找不到 Settings 按钮")
         pt = json.loads(raw)
         self._click_point(pt["x"], pt["y"])
         time.sleep(1.6)
 
-        # 2) 点弹出的菜单里文本为 Settings 的项
+        # 2) 点弹出的菜单里文本为 Settings/设置 的项（前端本地化后是「设置」）
         raw = p.js(
             "(function(){"
             "var els=[...document.querySelectorAll('div,span,li,[role=menuitem],button')]"
             ".filter(function(e){return e.offsetParent!==null"
-            "&&(e.textContent||'').trim()==='Settings'"
+            "&&((e.textContent||'').trim()==='Settings'||(e.textContent||'').trim()==='设置');"
             "&&e.getAttribute('aria-label')!=='Settings'"
+            "&&e.getAttribute('aria-label')!=='设置'"
             "&&e.children.length<=3;});"
             "if(!els.length)return null;"
             "var el=els[els.length-1];var r=el.getBoundingClientRect();"
