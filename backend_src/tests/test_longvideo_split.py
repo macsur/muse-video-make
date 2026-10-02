@@ -8,6 +8,7 @@
 时间码块 + 镜头行 + 段落 A/B/C，与真实剧本同构。
 """
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -352,9 +353,55 @@ def test_merge_trim():
               r3.get("ok") and r3.get("trimmed") is False, str(r3.get("reason")))
 
 
+def test_strip_text():
+    """剔除「要在画面上渲染文字」的句子。
+
+    2026-10-03 实测：只要提示词里出现字卡要求，muse.ai 就切进规划/对话模式
+    （反问「要把镜头04 的字卡换成中文…吗？」），整段 0 产出。同一份分镜里
+    唯一没有字卡的那一段一次就出片了。所以这不是优化，是能不能跑的区别。
+    """
+    print("C2 去文字指令")
+    s = L.strip_text_overlays(
+        '底部干净居中淡出字卡：“人生有上半场”。\n'
+        '* **画面与机位**：城市冷色夜景街头，唐进生挺直后背孤身缓步向前。\n'
+        '* **English Prompt**: `Minimalist elegant white subtitle appears: '
+        '"Life has a first half".`\n'
+        'A man standing amid passing cars and soft bokeh.')
+    check("删掉中文字卡句", "字卡" not in s, repr(s[:60]))
+    check("删掉英文字幕句", "subtitle" not in s.lower(), repr(s[-60:]))
+    check("保留画面描述", "夜景街头" in s and "孤身缓步向前" in s)
+    check("保留英文画面描述", "soft bokeh" in s)
+
+    # 片尾：LaTeX 块、引用行、书名号、以及 "Mr." 缩写后的那个点
+    tail = ('$$\\text{《唐先生的中场人生三部曲》}$$\n'
+            '* **排版内容**：\n'
+            '> 人生走到中场，\n'
+            '> 故事才真正开始。\n'
+            '* **English Prompt**: `Minimalist cinematic film typography gently '
+            'fades in at center: "Mr. Tang\'s Midlife Trilogy".`\n'
+            'The room is empty and the floor is wet.')
+    t = L.strip_text_overlays(tail)
+    check("删掉 LaTeX 块", "$$" not in t and "\\text" not in t, repr(t[:60]))
+    check("删掉引用行（宣传语）", "人生走到中场" not in t, repr(t[:80]))
+    check("删掉片名", "唐先生" not in t)
+    check("Mr. 缩写不断句，半句不外泄",
+          "Midlife Trilogy" not in t, repr(t[:120]))
+    check("无关描述仍在", "The room is empty and the floor is wet" in t)
+
+    # 整段都是字卡时，交给 build_segment_prompt 走黑场兜底
+    p = L.plan_segments(SAMPLE, SAMPLE_SECONDS)
+    sps = [L.build_segment_prompt(p, s) for s in p.segments]
+    check("每段提示词都不含字卡要求",
+          all(not re.search(r"字卡|排版内容|宣传语",
+                            L.strip_text_overlays(s.text)) for s in p.segments))
+    check("每段都声明画面无文字",
+          all("画面中不要出现任何文字" in x for x in sps))
+
+
 def main():
     for fn in (test_split, test_base, test_prompt, test_plain, test_short_script,
-               test_edges, test_pack, test_merge_degrade, test_merge_trim):
+               test_edges, test_pack, test_merge_degrade, test_merge_trim,
+               test_strip_text):
         fn()
     print()
     if _failures:

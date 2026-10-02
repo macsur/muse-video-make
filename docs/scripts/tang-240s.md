@@ -3,8 +3,8 @@
 在每一个提示词段落中嵌入一致性基底，确保全片不换脸、不衰老。
 
 > **角色基底描述 (Character Base Profile)**
-> **[Chinese]**: 唐进生，30多岁成熟英俊中国男性，高大健壮，宽肩厚背，腰腹紧实，姿态挺拔。五官端正，深沉眼神，眉骨突出，挺直鼻梁，下颌线极其清晰分明。干净利落的深色短发，鬓角带有少量自然黑色发丝，皮肤呈现真实的细微自然纹理。神态沉稳内敛，动作从容克制，绝无驼背或疲态老态。
-> **[English]**: A handsome and robust 30-year-old Chinese man named Tang Jinsheng, tall and well-built with broad shoulders, strong posture, well-defined sharp jawline, prominent brow bone, straight nose, and calm, deep eyes. Neat short dark hair with subtle natural grey streaks. Highly realistic skin texture with minor natural mature lines. Confident, restrained, composed.
+> **[Chinese]**: 唐进生，50多岁成熟英俊中国男性，高大健壮，宽肩厚背，腰腹紧实，姿态挺拔。五官端正，深沉眼神，眉骨突出，挺直鼻梁，下颌线极其清晰分明。干净利落的深色短发，鬓角带有少量自然灰白发丝，皮肤呈现真实的细微自然纹理。神态沉稳内敛，动作从容克制，绝无驼背或疲态老态。
+> **[English]**: A handsome and robust 50-year-old Chinese man named Tang Jinsheng, tall and well-built with broad shoulders, strong posture, well-defined sharp jawline, prominent brow bone, straight nose, and calm, deep eyes. Neat short dark hair with subtle natural grey streaks. Highly realistic skin texture with minor natural mature lines. Confident, restrained, composed.
 > **通用统一负向提示词 (Master Negative Prompt)**
 > `old age frail, wrinkled skin, sagging face, bald, receding hairline, hunched back, slouching, weak body, sickly, youthful idol, anime, cartoon, K-pop face, greasy expression, artificial smile, bodybuilder steroid muscles, excessive smoothing, fish-eye distortion, morphing face, inconsistent face.`
 
@@ -18,7 +18,7 @@
 
 * **镜头 01 (0:00—0:08) 青年时代练拳**
 * **画面与机位**：清晨薄雾中的旧城区院落，15岁左右年轻时的唐进生（黑发健硕）在击打悬挂沙袋，出拳迅猛、肌肉紧绷。中景至半身特写，50mm 镜头，柔和自然晨光。
-* **English Prompt**: `Cinematic 50mm shot, dawn morning soft light in an old courtyard. A muscular 30-year-old Chinese young man hitting a heavy hanging sandbag with clean, sharp, powerful punches. Defined shoulders and arms, focused expression, gritty realistic texture.`
+* **English Prompt**: `Cinematic 50mm shot, dawn morning soft light in an old courtyard. A muscular Chinese teenage boy around 15 years old hitting a heavy hanging sandbag with clean, sharp, powerful punches. Defined shoulders and arms, focused expression, gritty realistic texture.`
 
 
 * **镜头 02 (0:08—0:18) 沉默的家庭晚餐**
@@ -113,7 +113,7 @@
 
 * **镜头 16 (2:38—2:48) 岁月动作匹配剪辑 (Match Cut)**
 * **画面与机位**：【视觉跳切匹配】前一秒：年轻唐进生发力挥出一记重拳；后一秒：现在的唐进生在家中有力利落地披上厚外套，手臂与背部肌肉线条自然拉紧。
-* **English Prompt**: `Visual match cut: First shot of a 30-year-old muscular man throwing a powerful punch, seamlessly cut to the 50-year-old mature man firmly swinging a heavy jacket over his broad shoulders at home. Strength preserved.`
+* **English Prompt**: `Visual match cut: First shot of a muscular Chinese teenage boy around 15 years old throwing a powerful punch, seamlessly cut to the 50-year-old mature man firmly swinging a heavy jacket over his broad shoulders at home. Strength preserved.`
 
 
 * **镜头 17 (2:48—3:05) 镜前的凝视**

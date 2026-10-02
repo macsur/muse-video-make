@@ -519,6 +519,58 @@ def plan_segments(prompt: str, requested_duration: int,
     return plan
 
 
+# 需要从提示词里剔除的「渲染文字」类句子。
+# 2026-10-03 实测：只要提示词里出现「底部淡出字卡：…"人生有上半场"」这类要求，
+# muse.ai 就会切进**规划/对话**模式 —— 它反问「要把镜头04 的字卡换成中文…吗？」、
+# 「三个片段正在并行生成中，全部完成后我再拼接成 28 秒成片交付」，
+# 于是整段 0 产出，错误统一是「模型未生成媒体，仅返回文本」。
+# 同一份分镜里唯一没有字卡的那一段（第 1 段）一次就出片了，其余带字卡的段全灭。
+#
+# 所以：文字一律不进提示词，改由后期用 ffmpeg 压上去（见 plan_notes）。
+# 顺带的好处是视频模型本来就烧不好中文字幕，压字我们自己控制更准。
+_TEXT_OVERLAY_CJK = (r"字卡|字幕|标题文字|压字|文字排版|排版内容|片名|宣传语|"
+                     r"淡入文字|字体|文案|叠字|《|》")
+_TEXT_OVERLAY_EN = (r"subtitle|text overlay|typography|lettering|caption|"
+                    r"title fades|tagline|typed text|on-screen text|"
+                    r"midlife trilogy|holds for \d|clean kerning")
+# 句子里这些缩写后面的点**不是**句号，不能在那里断句
+# （"Mr. Tang's Midlife Trilogy" 会在 "Mr." 处被切开，剩半个句子漏出去）。
+_ABBREV = r"(?:Mr|Mrs|Ms|Dr|Prof|St|Mt|No|vs|etc|e\.g|i\.e|Jr|Sr)"
+
+
+def _is_text_sentence(s: str) -> bool:
+    return bool(re.search(_TEXT_OVERLAY_CJK, s)
+                or re.search(_TEXT_OVERLAY_EN, s, re.I))
+
+
+def strip_text_overlays(text: str) -> str:
+    """剔除提示词里所有「要在画面上渲染文字」的内容，只按句子删。
+
+    只按句子删，不动其余描述。删完如果整段几乎不剩内容（片尾那种
+    纯字卡段就是），交给调用方按黑场处理。
+    """
+    text = text or ""
+    # 片尾的排版块整体拿掉：LaTeX 公式、引用行、书名号标题。
+    # 这些不是「句子」，句子切分切不掉，必须先按块清掉。
+    text = re.sub(r"\$\$.*?\$\$", " ", text, flags=re.S)
+    text = re.sub(r"(?m)^\s*>.*$", " ", text)
+    text = re.sub(r"《[^》]*》", " ", text)
+    # 句末标点前是缩写时，先把点换成标记，免得在那里断句
+    text = re.sub(r"\b(%s)\." % _ABBREV, r"\1@@KEEP@@", text)
+    out = []
+    for sent in re.split(r"(?<=[。！？!?])\s*|\n|(?<=[a-z])\.\s+", text):
+        s = sent.replace("@@KEEP@@", ".").strip()
+        if not s or _is_text_sentence(s):
+            continue
+        out.append(s)
+    return "\n".join(out)
+
+
+# 一段里去掉文字要求后，至少要还剩这么多字才值得让 muse.ai 去拍，
+# 否则这一段其实是个纯字卡段（片尾），让它拍纯黑/空镜即可。
+_MIN_VISUAL_CHARS = 80
+
+
 def build_segment_prompt(plan: SegmentPlan, seg: Segment) -> str:
     """组装单段的实际提示词：生成指令 + 角色基底 + 段体。
 
@@ -551,8 +603,17 @@ def build_segment_prompt(plan: SegmentPlan, seg: Segment) -> str:
     chunks = [head]
     if plan.base:
         chunks.append("【本片统一的角色与画风设定】\n" + plan.base)
-    chunks.append(seg.text)
-    chunks.append("以上是本段的完整创作需求，请直接开始生成这个视频，"
+
+    # 文字一律不进提示词（见 strip_text_overlays 的实测记录）。
+    body = strip_text_overlays(seg.text)
+    if len(re.sub(r"[\s#*`—\-]", "", body)) < _MIN_VISUAL_CHARS:
+        # 片尾那种纯字卡段：没有可拍的内容，就让它拍一段干净黑场，
+        # 文字后期再压。绝不能把「渲染这段文字」原样交给模型。
+        body = ("纯黑场画面，缓慢平稳地淡入到深黑并保持，无任何物体、"
+                "无人物、无光影变化、无文字。")
+    chunks.append(body)
+    chunks.append("画面中不要出现任何文字、字幕、字卡、标题、台标或水印。"
+                  "以上是本段的完整创作需求，请直接开始生成这个视频，"
                   "不要输出文字方案、分镜说明或制作计划。")
 
     out = "\n\n".join(c for c in chunks if c and c.strip()).strip()
@@ -565,8 +626,8 @@ def build_segment_prompt(plan: SegmentPlan, seg: Segment) -> str:
         keep = BASE_MAX_CHARS - len(head) - len(tail) - 32
         b_len = min(len(plan.base), max(0, keep // 3))
         out = (head + "\n\n【本片统一的角色与画风设定】\n" + plan.base[:b_len]
-               + "\n\n" + seg.text[: max(0, keep - b_len)] + tail)
-        dropped = len(seg.text) - max(0, keep - b_len)
+               + "\n\n" + body[: max(0, keep - b_len)] + tail)
+        dropped = len(body) - max(0, keep - b_len)
         if dropped > 0:
             note = "第 %d 段剧本超出单段长度上限，已截断约 %d 字，该段剧情可能不完整" % (
                 seg.index, dropped)
