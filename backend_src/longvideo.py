@@ -635,9 +635,10 @@ def merge_segments(paths: List[str], out_path: str = "",
 
     if not out_path:
         from config import CFG  # 延迟导入：让本模块可离线单测
-        os.makedirs(os.path.join(CFG.media_dir, "merged"), exist_ok=True)
-        out_path = os.path.join(CFG.media_dir, "merged",
-                                "merged_%d.mp4" % int(time.time()))
+        os.makedirs(CFG.media_dir, exist_ok=True)
+        # 必须落在 media_dir **根下**、文件名里不能带 "/"：app.get_media 显式
+        # 拒绝含分隔符的名字（防目录穿越），写进 merged/ 子目录前端就取不到。
+        out_path = os.path.join(CFG.media_dir, "merged_%d.mp4" % int(time.time()))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
 
     tmp = work_dir or tempfile.mkdtemp(prefix="merge_")

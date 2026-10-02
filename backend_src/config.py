@@ -111,6 +111,31 @@ class Config:
     tool_protocol: bool = field(
         default_factory=lambda: _env("MUSE2API_TOOL_PROTOCOL", "0").strip() != "0")
 
+    # ---- 长视频自动分段 ----
+    # muse.ai 网页端单次最多只能出 30 秒（实测：全部历史产出都是 5/10/30 秒、
+    # 720x1280 h264 yuv420p 24fps）。超过 30 秒的请求会被自动拆段依次生成，
+    # 最后用 ffmpeg 合成。段内容上限默认取实测物理上限，不要往上调。
+
+    # 单段内容的秒数上限（硬约束，不建议超过 30）
+    video_seg_cap: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_SEG_CAP", "30")))
+    # 段数上限：480 秒 / 30 秒 = 16 段。超出则截断并在任务里明确写明丢了多少内容。
+    video_max_segments: int = field(
+        default_factory=lambda: int(_env("MUSE2API_VIDEO_MAX_SEGMENTS", "16")))
+    # 长视频整体预算（秒）。单个 30 秒视频实测 371 秒，16 段约 99 分钟，留余量取 2 小时。
+    long_video_budget: int = field(
+        default_factory=lambda: int(_env("MUSE2API_LONG_VIDEO_BUDGET", "7200")))
+    # 长视频每段的排队上限。分段任务逐段提交，段与段之间要释放浏览器，
+    # 所以不能用单段视频的 video_timeout 当排队上限。
+    seg_queue_timeout: int = field(
+        default_factory=lambda: int(_env("MUSE2API_SEG_QUEUE_TIMEOUT", "1800")))
+    # 是否用 ffmpeg 把分段合成一条。关掉则只返回分段列表。
+    video_merge: bool = field(
+        default_factory=lambda: _env("MUSE2API_VIDEO_MERGE", "1").strip() != "0")
+    # ffmpeg / ffprobe 路径。留空则用 shutil.which 探测；探测不到时降级为
+    # 「只返回分段列表」，绝不因为缺 ffmpeg 把已完成的任务变成失败。
+    ffmpeg: str = field(default_factory=lambda: _env("MUSE2API_FFMPEG", ""))
+    ffprobe: str = field(default_factory=lambda: _env("MUSE2API_FFPROBE", ""))
+
     @property
     def data_dir(self) -> str:
         return os.path.join(self.base_dir, "data")

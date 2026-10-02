@@ -46,6 +46,8 @@ from pydantic import BaseModel, Field
 
 from config import CFG
 from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError
+from longvideo import (MUSE_MAX_SINGLE_SECONDS, MUSE_SINGLE_DURATIONS,
+                       build_segment_prompt, merge_segments, plan_segments)
 from scheduler import ST_DONE, ST_FAILED, ST_QUEUED, ST_RUNNING, ST_TIMEOUT, Scheduler
 from store import Store, account_expiry, min_expiry
 
@@ -380,25 +382,39 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
 #     base64 乱码）时，`_normalize_image` 失败后**静默返回空**，任务照样往下跑，
 #     白等 1.5~3 倍时间才失败（实测 194.7s）。
 # 这里统一做「入口即校验」，把非法输入在提交阶段就打回去。
-_VIDEO_DURATIONS = {5, 6, 10, 30, 60, 120, 240, 480}          # 可选视频时长档位
+# muse.ai 单次**真正**支持的时长档位。原来的 {5,6,10,30,60,120,240,480} 是
+# 本 app 自己编的白名单：ffprobe 扫过全部历史产出，最长 30.0 秒，清一色
+# 720x1280。放行 240 秒的结果是 9858 字剧本原样发过去、agent 卡 600 秒零产出
+# （task_5aec863f8e1a4764b4ae）。
+_MUSE_SINGLE_DURATIONS = set(MUSE_SINGLE_DURATIONS)          # {5, 10, 30}
+_MAX_VIDEO_SECONDS = 480                                    # 更长则自动分段
 _VALID_IMAGE_MIME = {"image/png", "image/jpeg", "image/jpg", "image/webp",
                      "image/gif", "image/bmp"}
 _MAX_REF_BYTES = 20 * 1024 * 1024      # 参考图上限 20MB
 
 
 def validate_video_duration(d: int | None) -> int:
-    """校验并归一视频时长。缺陷 1。"""
+    """校验并归一视频时长。缺陷 1。
+
+    双档放行：
+    * ``5 / 10 / 30`` —— muse.ai 原生档位，一次生成出一条
+    * ``31 ~ 480`` —— 走长视频自动分段，拆成多个 <=30s 的短片依次生成后合成
+    """
     if d is None:
         return 6
     try:
         di = int(d)
     except (TypeError, ValueError):
         raise HTTPException(400, f"duration 必须是整数，收到: {d!r}")
-    if di not in _VIDEO_DURATIONS:
-        raise HTTPException(
-            400,
-            f"不支持的 duration={di}，仅支持 {sorted(_VIDEO_DURATIONS)} 秒")
-    return di
+    if di in _MUSE_SINGLE_DURATIONS:
+        return di
+    if MUSE_MAX_SINGLE_SECONDS < di <= _MAX_VIDEO_SECONDS:
+        return di
+    raise HTTPException(
+        400,
+        f"不支持的 duration={di}。可填 muse.ai 原生档位 {sorted(_MUSE_SINGLE_DURATIONS)}"
+        f"（一次出一条），或 {MUSE_MAX_SINGLE_SECONDS + 1}~{_MAX_VIDEO_SECONDS}"
+        f"（自动拆成多个 {MUSE_MAX_SINGLE_SECONDS} 秒短片后合成）")
 
 
 def validate_size(size: str | None, aspect_ratio: str | None) -> None:
@@ -960,7 +976,14 @@ def _condense_video_script(prompt: str, dur: int) -> str:
     return result if result.strip() else prompt[:600]
 
 
-def build_video_prompt(r: VideoRequest) -> str:
+def build_video_prompt(r: VideoRequest, executable_prompt: str | None = None) -> str:
+    """构造下发给 muse.ai 的视频提示词。
+
+    ``executable_prompt`` 非 None 时**跳过** ``_condense_video_script``。
+    长视频分段由 ``longvideo`` 负责切分和角色基底注入，段体已经是可执行的
+    单段指令；再走一遍压缩会把切好的段体二次裁剪，也会给每段都写一份
+    剧本备份（10 段 = 10 次落盘）。
+    """
     user_prompt = r.prompt.strip()
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
@@ -970,7 +993,8 @@ def build_video_prompt(r: VideoRequest) -> str:
     is_vertical = any(k in ar or k in sz for k in ("9:16", "9/16", "portrait", "竖屏", "720x1280", "1080x1920"))
 
     # 剧本类超长提示词自动压缩为模型可执行的单段视觉指令
-    executable_prompt = _condense_video_script(user_prompt, dur)
+    if executable_prompt is None:
+        executable_prompt = _condense_video_script(user_prompt, dur)
 
     parts = []
     if is_vertical:
@@ -1095,6 +1119,19 @@ def _pos(v) -> bool:
         return False
 
 
+def _deadline_error(last_exc) -> MuseGenerationError:
+    """超时时**带上最后一次真实错误**。
+
+    原来这两个 deadline 守卫直接抛「任务总等待时限已到，停止重试」，把
+    ``last_exc`` 丢掉了。用户看到的是误导性的原因，真实错误（实测绝大多数是
+    「等待生成超时，未出现新的生成结果」）被吞光，排查时完全看不出 muse.ai
+    到底干了什么 —— task_5aec863f8e1a4764b4ae 就是这么查了半天的。
+    """
+    if last_exc:
+        return MuseGenerationError(f"任务总等待时限已到，停止重试；最后一次错误：{last_exc}")
+    return MuseGenerationError("任务总等待时限已到，停止重试")
+
+
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None) -> tuple[dict, str | None]:
@@ -1125,7 +1162,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     cur_acc = acc
     for attempt in range(2):
         if deadline is not None and time.monotonic() >= deadline:
-            raise MuseGenerationError("任务总等待时限已到，停止重试")
+            raise _deadline_error(last_exc)
         if attempt > 0:
             if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
                 break
@@ -1141,7 +1178,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             engine.start()
             remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
             if remaining <= 0:
-                raise MuseGenerationError("任务总等待时限已到，停止重试")
+                raise _deadline_error(last_exc)
             res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                   timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                   account_id=cur_acc["id"], on_progress=on_progress,
@@ -1443,12 +1480,145 @@ async def images_edits(request: Request, _=Depends(auth)):
 
 
 # ------------------------- 生视频（异步任务） -------------------------
+
+# 进度分配：生成占 0~95，最后 5% 留给 ffmpeg 合成。
+_SEG_RENDER_TOP = 95
+
+
+def _seg_overall(done: int, total: int, seg_pct: float = 0.0,
+                 top: int = _SEG_RENDER_TOP) -> int:
+    """把「第 done/total 段 + 段内 seg_pct%」映射成整体进度。
+
+    进度必须**单调不减**：前端轮询时看到 95% 之后又跳回 30% 会直接崩掉用户
+    对系统的信任（缺陷 9 的教训 —— 宁可慢，不可倒退）。
+    """
+    if total <= 0:
+        return 0
+    span = max(1.0, float(top))
+    pct = (done + max(0.0, min(100.0, seg_pct)) / 100.0) * span / total
+    return max(0, min(int(top), int(round(pct))))
+
+
+def _drive_long_video(task_id: str, plan, req: VideoRequest,
+                      ref_img: str | None, budget: int) -> None:
+    """长视频驱动：逐段提交生成，段间释放浏览器，最后尝试合成。
+
+    **必须是普通线程，不能是 SCHED job，也不能写成 await 链**：
+    * 作为 SCHED job 提交的话，整个生成期间会一直持有 GEN_LOCK —— 单段实测
+      371 秒，10 段就是 33~62 分钟，期间 chat / image / 短 video 全部被堵死。
+      这里改成普通线程，**逐段** `SCHED.run_sync`，段与段之间浏览器让给别人。
+    * 写成 await 链的话，`run_sync` 的阻塞等待会卡死 FastAPI 事件循环。
+
+    失败策略（用户已确认）：任一段失败即中断整个任务，**保留已完成分段**，
+    不合成残缺版 —— 合成残缺片会让客户端拿到"看起来完整"的短片，
+    静默丢剧情比直接报错更难排查。
+    """
+    n = len(plan.segments)
+    t0 = time.time()
+    deadline = t0 + max(60, int(budget))
+    done: list[dict] = []
+    acc_id = None
+    notes = list(plan.notes)
+
+    try:
+        for seg in plan.segments:
+            if time.time() > deadline:
+                raise MuseGenerationError(
+                    f"长视频总预算 {int(budget)}s 已用尽，停在第 {seg.index}/{n} 段"
+                    f"（已完成 {len(done)} 段，剩余 {n - len(done)} 段未生成）")
+
+            body = build_segment_prompt(plan, seg)
+            # 每段按内容时长向上取档（5/10/30），请求里不能还写 240
+            seg_req = req.model_copy(update={"duration": seg.request_duration,
+                                             "timeout": CFG.video_timeout})
+            prompt = build_video_prompt(seg_req, executable_prompt=body)
+            log.info("【长视频 %s】第 %d/%d 段，%.0fs（请求 %ds，%d 字）",
+                     task_id[-8:], seg.index, n, seg.seconds,
+                     seg.request_duration, len(prompt))
+
+            store.update_task(task_id, status=ST_RUNNING, stage="rendering",
+                              segment_index=seg.index, segment_total=n,
+                              segment_done=len(done),
+                              progress=_seg_overall(len(done), n))
+
+            seg_t0 = time.time()
+
+            def prog_cb(p, _i=seg.index, _d=len(done)):
+                store.update_task(task_id, progress=_seg_overall(_d, n, p),
+                                  segment_index=_i, stage="rendering")
+
+            res, acc_id = SCHED.run_sync(
+                lambda p=prompt: _run_generation(
+                    p, "video", CFG.video_timeout, on_progress=prog_cb,
+                    reference_image=ref_img),
+                label=f"video:{task_id[-8:]}:seg{seg.index}",
+                queue_timeout=CFG.seg_queue_timeout)
+
+            entry = {"index": seg.index, "t_start": seg.t_start, "t_end": seg.t_end,
+                     "seconds": seg.seconds, "requested_duration": seg.request_duration,
+                     "url": media_url(res["filename"]), "filename": res["filename"],
+                     "path": res.get("path") or os.path.join(CFG.media_dir, res["filename"]),
+                     "bytes": res["size"], "kind": res["kind"],
+                     "elapsed": round(time.time() - seg_t0, 1)}
+            done.append(entry)
+            store.update_task(task_id, segments=done, segment_done=len(done),
+                              progress=_seg_overall(len(done), n), account=acc_id)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if done:
+            msg = f"{msg}（已完成 {len(done)}/{n} 段，分段文件已保留在 segments 里）"
+        store.update_task(task_id, status=ST_FAILED, stage="failed", error=msg,
+                          segments=done, segment_done=len(done),
+                          elapsed=round(time.time() - t0, 1), notes=notes)
+        log.error("【长视频 %s】失败于第 %d/%d 段（已完成 %d 段）: %s",
+                  task_id[-8:], len(done) + 1, n, len(done), exc)
+        return
+
+    # ---- 全部段落完成，尝试合成 ----
+    store.update_task(task_id, stage="merging", progress=96, segments=done,
+                      segment_done=len(done))
+    if not CFG.video_merge:
+        merge = {"ok": False, "reason": "已通过 MUSE2API_VIDEO_MERGE=0 关闭合成"}
+    elif len(done) < 2:
+        merge = {"ok": False, "reason": "只有 1 段，无需合成"}
+    else:
+        merge = merge_segments(
+            [e["path"] for e in done],
+            out_path=os.path.join(CFG.media_dir, "merged_%s.mp4" % task_id),
+            ffmpeg=CFG.ffmpeg, ffprobe=CFG.ffprobe)
+
+    elapsed = round(time.time() - t0, 1)
+    if merge.get("ok"):
+        name = os.path.basename(merge["path"])
+        vurl = media_url(name)
+        store.update_task(task_id, status=ST_DONE, progress=100, stage="done",
+                          account=acc_id, elapsed=elapsed, url=vurl,
+                          video={"url": vurl}, segments=done,
+                          segment_done=len(done), notes=notes,
+                          result={"url": vurl, "filename": name,
+                                  "bytes": os.path.getsize(merge["path"]),
+                                  "kind": "video",
+                                  "merge": {"ok": True, "mode": merge.get("mode"),
+                                            "seconds": merge.get("seconds")},
+                                  "segments": done, "notes": notes})
+    else:
+        # 降级：段落都生成成功了，**不算失败**。只把合成原因写清楚，
+        # 让前端渲染分段列表而不是显示"生成中 95%"。
+        log.warning("【长视频 %s】合成未完成，返回分段列表: %s", task_id[-8:], merge.get("reason"))
+        store.update_task(task_id, status=ST_DONE, progress=100, stage="done",
+                          account=acc_id, elapsed=elapsed, segments=done,
+                          segment_done=len(done), notes=notes,
+                          result={"url": None, "kind": "video",
+                                  "merge": {"ok": False, "reason": merge.get("reason")},
+                                  "segments": done, "notes": notes})
+
+
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
 async def create_video(req: VideoRequest, _=Depends(auth)):
     # ---- 入口校验（修缺陷 1 / 2 / 8）----
-    validate_video_duration(req.duration)          # 缺陷 1：时长白名单
-    validate_size(req.size, req.aspect_ratio)      # 缺陷 2：尺寸/比例校验
+    duration = validate_video_duration(req.duration)   # 缺陷 1：时长白名单
+    validate_size(req.size, req.aspect_ratio)           # 缺陷 2：尺寸/比例校验
     ref_img = None
     if req.reference_image:
         ref_img = req.reference_image
@@ -1459,9 +1629,38 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
 
     ref_img = validate_reference_image(ref_img)   # 缺陷 8：非法参考图入口即拒
 
+    task = store.create_task("video", req.prompt)
+
+    # ---- 长视频分支：>30s 自动拆段 ----
+    if duration > MUSE_MAX_SINGLE_SECONDS:
+        plan = plan_segments(req.prompt, duration,
+                             cap=CFG.video_seg_cap or MUSE_MAX_SINGLE_SECONDS,
+                             max_segments=CFG.video_max_segments)
+        if not plan.segments:
+            store.update_task(task["id"], status=ST_FAILED, stage="failed",
+                              error="长视频分段失败：" + "；".join(plan.notes))
+            raise HTTPException(400, "长视频分段失败：" + "；".join(plan.notes))
+        # 整份长剧本只备份一次（分段各自再走一遍 _condense 会写 N 份）
+        _save_script_backup(req.prompt)
+        store.update_task(task["id"], status=ST_QUEUED, progress=0, stage="queued",
+                          api_prompt="[长视频 %d 秒 → %d 段] %s" % (
+                              duration, len(plan.segments),
+                              build_segment_prompt(plan, plan.segments[0])[:200]),
+                          segment_total=len(plan.segments), segment_index=0,
+                          segment_done=0, segments=[], notes=plan.notes,
+                          duration=duration)
+        threading.Thread(target=_drive_long_video,
+                         args=(task["id"], plan, req, ref_img, CFG.long_video_budget),
+                         name="longvideo-%s" % task["id"][-8:], daemon=True).start()
+        return {"id": task["id"], "task_id": task["id"], "object": "video.task",
+                "status": ST_QUEUED, "progress": 0, "duration": duration,
+                "segment_total": len(plan.segments), "notes": plan.notes,
+                "queue_size": SCHED.queue_size,
+                "created_at": task["created_at"]}
+
+    # ---- 常规分支：<=30s，一次出一条 ----
     prompt = build_video_prompt(req)
     timeout = req.timeout or CFG.video_timeout
-    task = store.create_task("video", req.prompt)
     store.update_task(task["id"], api_prompt=prompt,
                       status=ST_QUEUED, progress=0, stage="queued")
 
@@ -1525,10 +1724,27 @@ def get_video(task_id: str, _=Depends(auth)):
         last = out.get("updated_at") or out.get("created_at") or time.time()
         idle = time.time() - last
         out["idle_seconds"] = round(idle, 1)
-        if idle > 120:
+        # 长视频的单段实测就要 371 秒，120 秒阈值会把每一段都误判成卡死。
+        # 合成阶段（stage=merging）纯 CPU，也要给足时间。
+        seg_total = out.get("segment_total")
+        if out.get("stage") == "merging":
+            stall_limit = 900
+        elif seg_total:
+            stall_limit = max(120, CFG.seg_queue_timeout + 180)
+        else:
+            stall_limit = 120
+        out["stall_limit_seconds"] = stall_limit
+        if idle > stall_limit:
             out["status"] = "stalled"
             out["stage"] = "stalled"
-            out["error"] = f"任务已 {int(idle)}s 无任何进展，疑似浏览器会话卡死"
+            if seg_total:
+                out["error"] = (f"第 {out.get('segment_index')} 段已 {int(idle)}s "
+                                f"无任何进展（共 {seg_total} 段），疑似浏览器会话卡死")
+            else:
+                out["error"] = f"任务已 {int(idle)}s 无任何进展，疑似浏览器会话卡死"
+    # 分段信息平铺出去，前端不必去翻 result
+    if out.get("segment_total"):
+        out.setdefault("segment_done", len(out.get("segments") or []))
     vurl = out.get("url")
     if not vurl and isinstance(out.get("result"), dict):
         vurl = out["result"].get("url")
@@ -2743,8 +2959,22 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 @app.on_event("startup")
 async def _startup():
     for task in list(store.tasks.values()):
-        if task.get("kind") == "image" and task.get("status") in ("queued", "processing"):
+        if task.get("status") not in ("queued", "processing", "running"):
+            continue
+        # 长视频重启后会丢在 processing 上：driver 是进程内线程，进程一死就没了。
+        # 不标 failed 的话它会永远卡在 processing，前端 120 秒后开始显示
+        # "疑似浏览器会话卡死"，用户完全不知道真实原因是重启。
+        if task.get("segment_total"):
+            done = task.get("segment_done") or len(task.get("segments") or [])
+            store.update_task(
+                task["id"], status="failed", stage="failed",
+                error=f"服务重启中断了长视频任务（已完成 {done}/{task['segment_total']} 段，"
+                      f"分段文件已保留），请重新提交")
+        elif task.get("kind") == "image":
             store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+        else:
+            store.update_task(task["id"], status="failed", stage="failed",
+                              error="服务重启中断了任务，请重新提交")
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)
