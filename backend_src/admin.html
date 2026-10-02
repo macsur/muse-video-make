@@ -1180,14 +1180,37 @@ async function loadTasks(){
     $('taskBody').innerHTML = ts.map(t => {
       const cls = (t.status === 'succeeded' || t.status === 'completed') ? 'ok' : t.status === 'failed' ? 'bad'
                 : t.status === 'processing' ? 'info' : 'warn';
+      // 长视频徽章：让一眼能看出是分段任务、跑到第几段、合成成没成。
+      // 8 列表头和 colspan="8" 一律不动，徽章塞进现有的「结果」单元格里。
+      const total = t.segment_total || (t.result && t.result.segments && t.result.segments.length) || 0;
+      const done = t.segment_done != null ? t.segment_done
+                 : (t.result && t.result.segments ? t.result.segments.length : 0);
+      let segBadge = '';
+      if (total > 1) {
+        const merged = t.result && t.result.merge && t.result.merge.ok;
+        const tone = t.status === 'failed' ? 'bad' : (t.status === 'completed' || t.status === 'succeeded')
+                   ? (merged ? 'ok' : 'warn') : 'info';
+        const label = merged ? `${done}/${total} 段 · 已合成`
+                            : (t.status === 'failed' ? `${done}/${total} 段 · 中断`
+                                                     : `${done}/${total} 段 · 未合成`);
+        segBadge = `<span class="badge ${tone}" style="margin-left:6px">${label}</span>`;
+      }
       let out = '—';
       if (t.result && t.result.url) out = `<a href="${esc(t.result.url)}" target="_blank">查看结果</a> <span class="mono">${fmtBytes(t.result.bytes)}</span>`;
+      else if (total > 1 && t.result && (t.result.segments || []).length) {
+        // 合成失败：把各分段列出来，否则这一格只会显示一个 "—"，看着像没产出
+        out = `<span style="color:var(--bad)">${esc((t.result.merge && t.result.merge.reason) || '未合成')}</span>`
+            + '<div style="margin-top:4px">'
+            + (t.result.segments || []).map(s =>
+                `<a href="${esc(s.url)}" target="_blank" style="margin-right:6px">第${s.index}段</a>`).join('')
+            + '</div>';
+      }
       else if (t.error) out = `<span style="color:var(--bad)">${esc(t.error).slice(0,120)}</span>`;
       return `<tr>
         <td class="mono">${esc(t.id)}</td>
         <td>${t.kind === 'video' ? '<span class="badge info">视频</span>' : '<span class="badge info">图片</span>'}</td>
         <td><span class="ellip" title="${esc(t.prompt)}">${esc(t.prompt)}</span></td>
-        <td><span class="badge ${cls}">${esc(t.status)}</span></td>
+        <td><span class="badge ${cls}">${esc(t.status)}</span>${segBadge}</td>
         <td class="mono">${t.elapsed ? t.elapsed + 's' : '—'}</td>
         <td class="mono">${fmtTime(t.created_at)}</td>
         <td>${out}</td>

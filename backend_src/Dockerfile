@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-wqy-zenhei \
     fonts-freefont-ttf \
     procps \
+    ffmpeg \
     curl \
     git \
     ca-certificates \
@@ -27,7 +28,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制代码与必要目录
-COPY admin.html app.py cdp.py config.py engine.py store.py scheduler.py version.json ./
+COPY admin.html app.py cdp.py config.py engine.py longvideo.py store.py scheduler.py version.json ./
 COPY deploy/ ./deploy/
 COPY extension/ ./extension/
 COPY tools/ ./tools/

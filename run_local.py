@@ -34,7 +34,11 @@ CONFIG_FILE = os.path.join(DATA_DIR, "local_config.json")
 VENV_DIR = os.path.join(BASE_DIR, ".venv_local")
 WEB_DIR = os.path.join(BASE_DIR, "web")
 
-MUSE2API_REPO = "yys9253462-gif/muse2api"
+# 真正的服务端仓库。原先写的是 yys9253462-gif/muse2api（不存在），
+# yys9253462-gif/muse-video-installer 是本安装器自己的仓库，别搞混。
+# 地址写错的后果平时看不出来（ensure_backend_source 见 backend_src 已存在就
+# 直接 return），但一旦删掉 backend_src/ 想重新拉源码就会失败。
+MUSE2API_REPO = "czg86389-hub/muse2api"
 MUSE2API_REF = "main"
 
 DEFAULT_API_PORT = 18610
@@ -411,6 +415,19 @@ def main():
     env["MUSE2API_HOME_DIR"] = BASE_DIR
     env["MUSE2API_PROFILE_ROOT"] = os.path.join(DATA_DIR, "profiles")
     env["MUSE2API_PUBLIC_BASE"] = f"http://127.0.0.1:{cfg['api_port']}"
+
+    # ffmpeg：长视频分段后要靠它合成。探测不到不算致命 —— 后端会降级成
+    # 「只返回分段列表」，但要提前告诉用户，否则他等 40 分钟才发现拿不到合成片。
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg and ffprobe:
+        env["MUSE2API_FFMPEG"] = ffmpeg
+        env["MUSE2API_FFPROBE"] = ffprobe
+        log_ok(f"ffmpeg 已就绪，长视频将自动分段并合成 ({ffmpeg})")
+    else:
+        missing = "ffmpeg" if not ffmpeg else "ffprobe"
+        log_warn(f"未检测到 {missing}：长视频仍会自动分段，但只会返回分段列表，"
+                 f"不会合成成一条。macOS 可执行 brew install ffmpeg")
 
     cmd = [
         venv_py,

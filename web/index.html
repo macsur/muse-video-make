@@ -145,10 +145,10 @@
             <option value="6">6 秒</option>
             <option value="10">10 秒</option>
             <option value="30">30 秒</option>
-            <option value="60">60 秒</option>
-            <option value="120">120 秒</option>
-            <option value="240">240 秒</option>
-            <option value="480">480 秒</option>
+            <option value="60">60 秒（自动分段）</option>
+            <option value="120">120 秒（自动分段）</option>
+            <option value="240">240 秒（自动分段）</option>
+            <option value="480">480 秒（自动分段）</option>
           </select>
         </label>
         <label class="field">
@@ -265,8 +265,14 @@
 
   function loadHist(){ try{ state.tasks=JSON.parse(localStorage.getItem(LS_HIST)||'[]'); }catch(e){ state.tasks=[]; } renderHist(); }
   function saveHist(){
+    // segments 必须一起存：长视频合成失败时前端靠它渲染分段列表，
+    // 刷新一次就把分段信息丢了的话，用户只剩一个空白的"已完成"。
     var slim=state.tasks.slice(0,30).map(function(t){ return {id:t.id,prompt:t.prompt,status:t.status,
-      size:t.size,duration:t.duration,created:t.created,url:t.url||'',bytes:t.bytes||0,err:t.err||''}; });
+      size:t.size,duration:t.duration,created:t.created,url:t.url||'',bytes:t.bytes||0,err:t.err||'',
+      segmentTotal:t.segmentTotal||0,segmentDone:t.segmentDone||0,
+      mergeReason:t.mergeReason||'',notes:t.notes||[],
+      segments:(t.segments||[]).map(function(s){ return {index:s.index,url:s.url,
+        seconds:s.seconds,bytes:s.bytes}; })}; });
     try{ localStorage.setItem(LS_HIST,JSON.stringify(slim)); }catch(e){}
   }
   function addTask(t){ state.tasks.unshift(t); if(state.tasks.length>30) state.tasks.length=30; renderHist(); saveHist(); }
@@ -294,30 +300,82 @@
     });
   }
 
+  function absUrl(u){ return /^https?:\/\//i.test(u)?u:state.base+u; }
+
+  function notesHtml(t){
+    if(!t.notes||!t.notes.length) return '';
+    return t.notes.map(function(n){ return '<div class="prog-note">'+esc(n)+'</div>'; }).join('');
+  }
+
+  function segmentsHtml(t){
+    // 合成失败（或未启用）时 result.url 为空，只能靠分段列表交付。
+    // 这里的判断不能写成 status==='completed'&&url —— 那会掉到下面的
+    // "生成中"分支显示一个永远 100% 的进度条，用户以为还在跑。
+    var segs=t.segments||[];
+    if(!segs.length) return '';
+    var rows=segs.map(function(s){
+      var abs=absUrl(s.url);
+      return '<div style="display:flex;gap:10px;align-items:center;margin-top:8px;padding:8px;'+
+        'border:1px solid var(--border);border-radius:8px">'+
+        '<span class="prog-pct" style="min-width:52px">第 '+(s.index)+' 段</span>'+
+        '<span style="flex:1">'+(s.seconds?s.seconds+'s · ':'')+
+          (s.bytes?fmtBytes(s.bytes):'')+'</span>'+
+        '<a href="'+abs+'" download target="_blank" rel="noopener">'+
+          '<button class="btn btn-ghost">下载</button></a></div>';
+    }).join('');
+    return '<div class="prog-head" style="margin-top:16px"><span class="prog-status">分段结果</span>'+
+      '<span class="prog-pct">'+segs.length+' 段</span></div>'+rows;
+  }
+
   function showTask(t){
     var area=$('taskArea'); $('taskHint').textContent=t.id||'';
     if(t.status==='completed'&&t.url){
-      var abs=/^https?:\/\//i.test(t.url)?t.url:state.base+t.url;
+      var abs=absUrl(t.url);
+      var segNote=(t.segmentTotal>1)?
+        '<div class="prog-note" style="margin-top:10px">由 '+t.segmentDone+' 个短片合成，'+
+          esc(t.mergeReason||'耗时较长属正常')+'</div>':'';
       area.innerHTML='<video src="'+abs+'" controls playsinline preload="metadata"></video>'+
         '<div class="result-meta"><div class="meta-txt">'+esc(t.size||'')+' · '+(t.duration||5)+'s'+
         (t.bytes?' · '+fmtBytes(t.bytes):'')+'</div><div class="result-actions">'+
         '<a href="'+abs+'" download target="_blank" rel="noopener"><button class="btn btn-ghost">下载视频</button></a>'+
         '<a href="'+abs+'" target="_blank" rel="noopener"><button class="btn btn-ghost">新窗口打开</button></a>'+
-        '</div></div><div class="prog-note" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">'+
+        '</div></div>'+notesHtml(t)+segNote+
+        '<div class="prog-note" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">'+
+        esc(t.prompt||'')+'</div>';
+      return;
+    }
+    if(t.status==='completed'){
+      // 段落都生成成功了，只是没能合成
+      area.innerHTML='<div class="prog-head"><span class="prog-status" style="color:var(--warn)">'+
+        '分段已生成，未合成</span></div>'+
+        '<div class="prog-note err">'+
+        esc(t.mergeReason||'合成未完成，下面是各分段，可单独下载后自行拼接')+'</div>'+
+        notesHtml(t)+segmentsHtml(t)+
+        '<div class="prog-note" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">'+
         esc(t.prompt||'')+'</div>';
       return;
     }
     if(t.status==='failed'){
       area.innerHTML='<div class="prog-head"><span class="prog-status" style="color:var(--err)">生成失败</span></div>'+
         '<div class="prog-note err">'+esc(t.err||'未知错误')+'</div>'+
+        notesHtml(t)+segmentsHtml(t)+
         '<div class="prog-note" style="margin-top:12px">'+esc(t.prompt||'')+'</div>';
       return;
     }
     var pct=t.progress||0;
-    area.innerHTML='<div class="prog-head"><span class="prog-status">'+(pct>=100?'正在保存':'生成中')+
+    var isLong=!!(t.segmentTotal&&t.segmentTotal>1);
+    var stageTxt=isLong
+      ? ('第 '+(t.segmentDone||0)+'/'+t.segmentTotal+' 段'
+         + (t.segmentIndex?('（正在生成第 '+t.segmentIndex+' 段）'):'')
+         + (pct>=100&&(t.segmentDone||0)<t.segmentTotal?' · 即将合成':''))
+      : (pct>=100?'正在保存':'生成中');
+    area.innerHTML='<div class="prog-head"><span class="prog-status">'+esc(stageTxt)+
       '</span><span class="prog-pct">'+pct+'%</span></div>'+
       '<div class="bar"><i style="width:'+Math.max(pct,4)+'%"></i></div>'+
-      '<div class="prog-note">视频生成通常需要 1～2 分钟，请保持页面打开</div>'+
+      '<div class="prog-note">'+(isLong
+        ? '长视频会逐段生成再合成，单段约 3～6 分钟，请保持页面打开'
+        : '视频生成通常需要 1～2 分钟，请保持页面打开')+'</div>'+
+      notesHtml(t)+
       '<div class="prog-note" style="margin-top:12px">'+esc(t.prompt||'')+'</div>';
   }
 
@@ -329,13 +387,20 @@
   function poll(id){
     fetch(api('/v1/videos/'+id),{headers:headers()}).then(function(r){ return r.json(); }).then(function(j){
       var status=j.status, pct=(typeof j.progress==='number')?j.progress:0;
-      var patch={status:status,progress:pct};
+      var res=j.result||{};
+      var patch={status:status,progress:pct,
+        segmentTotal:j.segment_total||0, segmentDone:j.segment_done||0,
+        segmentIndex:j.segment_index||0, notes:j.notes||[],
+        // 合成失败时 res.url 为空但分段都在，必须把 merge 原因带回来，
+        // 否则前端会显示一个"已完成但没有视频"的空结果。
+        mergeReason:(res.merge&&res.merge.reason)||'',
+        segments:(res.segments||j.segments||[])};
       if(status==='completed'||status==='succeeded'){
-        var res=j.result||{};
-        patch.status='completed'; patch.url=res.url||''; patch.bytes=res.bytes||0;
+        patch.status='completed'; patch.url=res.url||j.url||'';
+        patch.bytes=res.bytes||0;
         stopPolling(); setBusy(false); updTask(id,patch);
         showTask(Object.assign({id:id},patch,{prompt:currentPrompt(id),size:state.size,duration:curDur}));
-        toast('视频生成完成'); return;
+        toast(patch.url?'视频生成完成':'分段已生成（未合成）'); return;
       }
       if(status==='failed'||status==='error'){
         patch.status='failed'; patch.err=j.error||'生成失败';
@@ -374,10 +439,18 @@
         var id=res.body.id||res.body.task_id;
         if(!id) throw new Error('服务端未返回任务 ID');
         state.taskId=id;
-        addTask({id:id,prompt:prompt,status:'queued',progress:10,size:state.size,
-          duration:payload.duration,created:Math.floor(Date.now()/1000),url:'',bytes:0,err:''});
-        showTask({id:id,prompt:prompt,status:'queued',progress:10,size:state.size,duration:payload.duration});
-        toast('任务已提交，正在生成…'); startPolling(id);
+        // 长视频在提交响应里就带 segment_total，先塞进去，首帧就能显示
+        // "第 0/N 段"，否则第一次渲染会闪一下通用文案。
+        var seed={id:id,prompt:prompt,status:'queued',progress:10,size:state.size,
+          duration:payload.duration,created:Math.floor(Date.now()/1000),url:'',bytes:0,err:'',
+          segmentTotal:res.body.segment_total||0, segmentDone:0, notes:res.body.notes||[],
+          mergeReason:'', segments:[]};
+        addTask(seed);
+        showTask(Object.assign({},seed));
+        toast(res.body.segment_total
+          ? '任务已提交，将分成 '+res.body.segment_total+' 段依次生成…'
+          : '任务已提交，正在生成…');
+        startPolling(id);
       })
       .catch(function(e){ setBusy(false); toast('提交失败：'+e.message); });
   }
