@@ -1,6 +1,6 @@
 # Muse 视频工作台 · 一键安装
 
-[![Release](https://img.shields.io/github/v/release/yys9253462-gif/muse-video-installer?label=%E6%9C%80%E6%96%B0%E7%89%88)](https://github.com/yys9253462-gif/muse-video-installer/releases/latest)
+[![Release](https://img.shields.io/github/v/release/macsur/muse-video-make?label=%E6%9C%80%E6%96%B0%E7%89%88)](https://github.com/macsur/muse-video-make/releases/latest)
 [![License](https://img.shields.io/github/license/yys9253462-gif/muse-video-installer)](LICENSE)
 
 > 在**你自己的服务器**上，一条命令装好一个「输入文字就能生成视频」的网页工具。
