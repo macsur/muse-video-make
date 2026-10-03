@@ -10,6 +10,40 @@
 
 ---
 
+## 致谢
+
+本仓库建立在以下开源项目之上，作者们完成了绝大部分底层工作。**没有他们就没有这个项目。**
+
+| 项目 | 作者 | 链接 | 协议 |
+|---|---|---|---|
+| **muse2api**（上游） | [czg86389-hub](https://github.com/czg86389-hub) | [czg86389-hub/muse2api](https://github.com/czg86389-hub/muse2api) | MIT |
+| **muse2api**（程序本体 + 稳定性修复） | [yys9253462-gif](https://github.com/yys9253462-gif) | [yys9253462-gif/muse2api](https://github.com/yys9253462-gif/muse2api) | MIT |
+| **muse-video-installer**（安装脚本、工作台） | [yys9253462-gif](https://github.com/yys9253462-gif) | [yys9253462-gif/muse-video-installer](https://github.com/yys9253462-gif/muse-video-installer) | MIT |
+
+依赖关系自下而上：
+
+```
+czg86389-hub/muse2api          ← 上游原型
+        ↓
+yys9253462-gif/muse2api        ← 程序本体（叠加 11 项稳定性与安全修复）
+        ↓
+yys9253462-gif/muse-video-installer  ← 一键安装脚本 + 网页工作台
+        ↓
+本仓库                            ← 长视频分段管线、安全加固、剧本压缩修复
+```
+
+- 协议：上游为 **MIT**，本仓库同样以 MIT 发布（见 [LICENSE](LICENSE) 与
+  [`backend_src/LICENSE`](backend_src/LICENSE)）。MIT 要求保留原始版权声明，
+  两个 LICENSE 文件均已原样保留。
+- 本仓库作者对上游的**任何改动都无条件贡献回去**；上游合并
+  [PR #5](https://github.com/czg86389-hub/muse2api/pull/5) 后可直接切回官方版本。
+- 若上游作者认为本仓库的署名或表述需要调整，请提 issue 或 PR，我们无条件配合更正。
+
+> 📌 另需感谢 muse.ai（Meta）提供视频生成能力。本项目是**非官方**的第三方封装，
+> 与 Meta、muse.ai 无隶属或背书关系。
+
+---
+
 ## 目录
 
 - [先搞清楚：这里说的「服务器」是什么](#先搞清楚这里说的服务器是什么)
