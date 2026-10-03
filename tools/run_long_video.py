@@ -28,7 +28,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend_src"))
 
-DEFAULT_SCRIPT = ROOT / "docs" / "scripts" / "tang-240s.md"
+DEFAULT_SCRIPT = ROOT / "素材库" / "唐进生视频剧本" / "唐先生的中场人生三部曲_240秒分镜剧本.md"
+if not DEFAULT_SCRIPT.is_file():  # 发布包里带的是素材库那份样本
+    DEFAULT_SCRIPT = ROOT / "docs" / "scripts" / "tang-240s.md"
 TERMINAL = {"done", "failed", "succeeded", "success", "error", "stalled"}
 
 

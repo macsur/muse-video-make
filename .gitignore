@@ -21,3 +21,6 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+
+# 打包产物（tools/build_release.py 生成，不进版本库）
+dist/
