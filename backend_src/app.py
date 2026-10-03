@@ -856,6 +856,50 @@ def _save_script_backup(prompt: str) -> str:
     return key
 
 
+# 压缩后执行指令的字数上限。
+_CONDENSE_MAX = 700
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """按句读边界裁剪，绝不从单词/句子中间切断。
+
+    muse.ai 拿到残缺指令时的反应不是报错，而是**静默不生成**：一直等到
+    video_timeout 耗尽才报「等待生成超时，未出现新的生成结果」（实测
+    task_5717af4ebbed41d9b9cc 就是下发的提示词停在 `...bald, receding h`、
+    反引号都没闭合）。所以宁可少发内容，也不能发半句。
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for sep in ("。", "；", ";", "，", ",", "、", " "):
+        idx = cut.rfind(sep)
+        if idx >= limit // 2:
+            return cut[:idx] + "…"
+    return cut + "…"
+
+
+def _build_negative(neg_lines: list[str]) -> str:
+    """组装「禁止：」段。
+
+    原来这里是拿 9 个中文关键词（'老人脸'/'衰老'/'驼背'…）去**过滤**
+    neg_lines，而 Master Negative Prompt 是一整段英文 comma list，一个词都
+    匹配不上 → 整段被丢弃，等于把用户真正写的禁用约束扔了。所以改成原样保留
+    （去掉 markdown 反引号），只做长度控制。
+    """
+    out: list[str] = []
+    used = 0
+    for raw in neg_lines:
+        n = raw.strip().strip("`").strip().rstrip("。").strip()
+        if not n or n in out:
+            continue
+        out.append(n)
+        used += len(n)
+        if used >= 170:
+            break
+    return _clip_text("，".join(out), 180)
+
+
 def _condense_video_script(prompt: str, dur: int) -> str:
     """把多镜头剧本类提示词压缩成视频模型可执行的单段视觉指令。
 
@@ -898,44 +942,68 @@ def _condense_video_script(prompt: str, dur: int) -> str:
     scenes: list[list[str]] = []   # 每个元素是一个场景的行列表
     cur_scene: list[str] = []
 
-    in_neg = in_photo = in_light = in_scene = False
+    in_char = in_neg = in_photo = in_light = in_scene = False
 
-    scene_pattern = re.compile(r'【镜头[一二三四五六七八九十\d]|【0:\d|【第[一二三四五六七八九十]')
-    neg_pattern   = re.compile(r'【.*?(负面提示|全片人物负面|禁止)')
-    photo_pattern = re.compile(r'【.*?(统一摄影|摄影规则|镜头规则)')
-    light_pattern = re.compile(r'【.*?(统一光线|光线规则)')
-    section_end   = re.compile(r'【')  # 任何新的【开头标题都意味着当前块结束
+    # 剧本有两种写法：【镜头X】方括号体，和 markdown 引用体
+    # （`### 一、 核心资产设定…` / `> **通用统一负向提示词 …**` / `* **镜头 10 …**`）。
+    # 2026-10-03 task_5717af4ebbed41d9b9cc 用的是后者，而原来这一整套模式只认
+    # 【】——neg/photo/light/scene 四个正则一个都没匹配上，全文每一行都掉进
+    # 「人物描述」兜底分支，于是角色基底、负向提示、镜头 10 被当成同一个人物
+    # 描述串在一起，最后再被 700 字硬切。所以每个模式都得同时认这两种写法。
+    scene_pattern = re.compile(r'【镜头[一二三四五六七八九十\d]|【0:\d|【第[一二三四五六七八九十]'
+                               r'|镜头\s*[0-9一二三四五六七八九十]+\s*[（(：:]')
+    # 注意 char_pattern 必须排在 neg_pattern 前面判：角色基底那个标题
+    # 「### 一、 核心资产设定：角色基底与负向提示词 (Master Consistency Prompt)」
+    # 同时含「核心资产设定」和「负向提示词」，先判 neg 会把它误开成负向块。
+    char_pattern  = re.compile(r'角色基底描述|Character\s*Base\s*Profile'
+                               r'|Master\s*Consistency\s*Prompt|核心资产设定', re.I)
+    neg_pattern   = re.compile(r'【.*?(负面提示|全片人物负面|禁止)'
+                               r'|负面提示词|Master\s*Negative\s*Prompt', re.I)
+    photo_pattern = re.compile(r'【.*?(统一摄影|摄影规则|镜头规则)|摄影规则')
+    light_pattern = re.compile(r'【.*?(统一光线|光线规则)|光线规则')
+    section_end   = re.compile(r'【|^\s*#{1,6}\s')  # 新标题意味着当前块结束
 
     for line in lines:
         s = line.strip()
         if not s or s == '⸻' or s.startswith('=='):
             continue
+        # 归一化 markdown：引用符、加粗标记、反引号全部去掉。这里产出的是
+        # 喂给模型的自然语言指令而不是 markdown，留着 `**`/`` ` `` 只会变成
+        # 噪声，还会在裁剪时留下半个代码块（`Over-the-shoulder…` 缺右反引号）。
+        s = s.lstrip('>').strip()
+        s = s.replace('**', '').strip().strip('*').strip()
+        s = s.replace('`', '').strip()
 
+        if char_pattern.search(s):
+            if in_scene and cur_scene:
+                scenes.append(cur_scene); cur_scene = []
+            in_char = True; in_neg = in_photo = in_light = in_scene = False
+            continue
         if neg_pattern.search(s):
             if in_scene and cur_scene:
                 scenes.append(cur_scene); cur_scene = []
-            in_neg = True; in_photo = in_light = in_scene = False
+            in_neg = True; in_char = in_photo = in_light = in_scene = False
             continue
         if photo_pattern.search(s):
             if in_scene and cur_scene:
                 scenes.append(cur_scene); cur_scene = []
-            in_photo = True; in_neg = in_light = in_scene = False
+            in_photo = True; in_char = in_neg = in_light = in_scene = False
             continue
         if light_pattern.search(s):
             if in_scene and cur_scene:
                 scenes.append(cur_scene); cur_scene = []
-            in_light = True; in_neg = in_photo = in_scene = False
+            in_light = True; in_char = in_neg = in_photo = in_scene = False
             continue
         if scene_pattern.search(s):
             if in_scene and cur_scene:
                 scenes.append(cur_scene); cur_scene = []
-            in_scene = True; in_neg = in_photo = in_light = False
+            in_scene = True; in_char = in_neg = in_photo = in_light = False
             continue
         # 其他【标题（结构段）：结束当前收集
         if s.startswith('【') and section_end.match(s):
             if in_scene and cur_scene:
                 scenes.append(cur_scene); cur_scene = []
-            in_neg = in_photo = in_light = in_scene = False
+            in_char = in_neg = in_photo = in_light = in_scene = False
             continue
 
         if in_neg:
@@ -955,7 +1023,8 @@ def _condense_video_script(prompt: str, dur: int) -> str:
                 cur_scene.append(s)
             continue
 
-        # 人物描述（剧本最前面、还没进任何块之前的段落）
+        # 人物描述：还没进任何块（含角色基底块）且场景尚未开始。
+        # in_char 走这里和「剧本开头的裸段落」落到同一个列表，无需单独分支。
         if not any([in_neg, in_photo, in_light, in_scene]) and len(scenes) == 0:
             if len(s) > 2 and not s.startswith('【') and not s.startswith('#'):
                 if len(char_lines) < 20:
@@ -964,40 +1033,48 @@ def _condense_video_script(prompt: str, dur: int) -> str:
     if in_scene and cur_scene:
         scenes.append(cur_scene)
 
-    # 组装执行指令
-    parts_out: list[str] = []
+    # 组装执行指令。**按优先级贪心拼接**：角色基底和负向提示是最该保留的
+    # （前者决定全片一致性，后者决定不翻车），场景/摄影/光线放不下就整段
+    # 舍弃。原来这里是「先全拼上再 result[:700]」，硬切会把负向提示从单词
+    # 中间劈开，末尾连反引号都不闭合。
+    cands: list[str] = []
 
-    # 人物核心视觉
-    char_desc = '，'.join(char_lines[:12])
+    char_desc = _clip_text('，'.join(char_lines[:12]), 240)
     if char_desc:
-        parts_out.append(f"人物：{char_desc}")
+        cands.append(f"人物：{char_desc}")
+
+    neg_text = _build_negative(neg_lines)
+    if neg_text:
+        cands.append(f"禁止：{neg_text}")
 
     # 选取指定数量的场景
     selected = scenes[:max_scenes]
     for i, sc in enumerate(selected, 1):
-        sc_text = '，'.join(sc[:10])
+        sc_text = _clip_text('，'.join(sc[:10]), 200)
+        if not sc_text:
+            continue
         label = f"镜头{i}" if max_scenes > 1 else "场景"
-        parts_out.append(f"{label}：{sc_text}")
+        cands.append(f"{label}：{sc_text}")
 
     # 摄影规则摘要（最多 5 条）
     if photo_lines:
-        parts_out.append(f"摄影：{'，'.join(photo_lines[:5])}")
+        t = _clip_text('，'.join(photo_lines[:5]), 120)
+        if t:
+            cands.append(f"摄影：{t}")
 
     # 光线规则摘要（最多 3 条）
     if light_lines:
-        parts_out.append(f"光线：{'，'.join(light_lines[:3])}")
+        t = _clip_text('，'.join(light_lines[:3]), 80)
+        if t:
+            cands.append(f"光线：{t}")
 
-    # 负面提示（核心禁用词）
-    neg_key = ['老人脸', '衰老', '松弛', '肥胖', '驼背', '秃顶', '夸张肌肉', '网红脸', '磨皮']
-    neg_filtered = [n for n in neg_lines if any(k in n for k in neg_key)]
-    if neg_filtered:
-        parts_out.append(f"禁止：{'，'.join(neg_filtered[:6])}")
+    result = ""
+    for txt in cands:
+        cand = txt if not result else result + "。" + txt
+        if len(cand) <= _CONDENSE_MAX:
+            result = cand
 
-    result = '。'.join(parts_out)
-    if len(result) > 700:
-        result = result[:700]
-
-    return result if result.strip() else prompt[:600]
+    return result if result.strip() else _clip_text(prompt, 600)
 
 
 def build_video_prompt(r: VideoRequest, executable_prompt: str | None = None) -> str:
