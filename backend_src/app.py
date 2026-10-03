@@ -1678,7 +1678,8 @@ def _run_segment_with_retry(prompt: str, prog_cb, ref_img, seg, n: int,
 
 
 def _drive_long_video(task_id: str, plan, req: VideoRequest,
-                      ref_img: str | None, budget: int) -> None:
+                      ref_img: str | None, budget: int,
+                      existing_segments: list[dict] | None = None) -> None:
     """长视频驱动：逐段提交生成，段间释放浏览器，最后尝试合成。
 
     **必须是普通线程，不能是 SCHED job，也不能写成 await 链**：
@@ -1690,6 +1691,7 @@ def _drive_long_video(task_id: str, plan, req: VideoRequest,
     失败策略（用户已确认）：任一段失败即中断整个任务，**保留已完成分段**，
     不合成残缺版 —— 合成残缺片会让客户端拿到"看起来完整"的短片，
     静默丢剧情比直接报错更难排查。
+    支持断点续传：若传入已有的 valid segments，跳过已落盘的分段直接从断点继续。
     """
     n = len(plan.segments)
     t0 = time.time()
@@ -1698,8 +1700,32 @@ def _drive_long_video(task_id: str, plan, req: VideoRequest,
     acc_id = None
     notes = list(plan.notes)
 
+    # 载入并校验已有的分段检查点（物理文件有效才复用）
+    if existing_segments:
+        for prev in existing_segments:
+            p = prev.get("path")
+            if not p and prev.get("filename"):
+                p = os.path.join(CFG.media_dir, prev["filename"])
+            if p and os.path.isfile(p) and os.path.getsize(p) > 1024:
+                item = dict(prev)
+                item["path"] = p
+                done.append(item)
+            else:
+                log.warning("【长视频 %s】检查点第 %s 段文件失效或丢失 (%s)，将重新生成",
+                            task_id[-8:], prev.get("index"), p)
+
+    existing_indices = {d["index"] for d in done if "index" in d}
+    if done:
+        log.info("【长视频 %s】加载断点检查点：已完成 %d/%d 段",
+                 task_id[-8:], len(done), n)
+
     try:
         for seg in plan.segments:
+            if seg.index in existing_indices:
+                log.info("【长视频 %s】命中断点检查点，跳过第 %d/%d 段 (%.0fs)",
+                         task_id[-8:], seg.index, n, seg.seconds)
+                continue
+
             if time.time() > deadline:
                 raise MuseGenerationError(
                     f"长视频总预算 {int(budget)}s 已用尽，停在第 {seg.index}/{n} 段"
@@ -1740,6 +1766,8 @@ def _drive_long_video(task_id: str, plan, req: VideoRequest,
                      "bytes": res["size"], "kind": res["kind"],
                      "elapsed": round(time.time() - seg_t0, 1)}
             done.append(entry)
+            existing_indices.add(seg.index)
+            done.sort(key=lambda x: x.get("index", 0))
             store.update_task(task_id, segments=done, segment_done=len(done),
                               progress=_seg_overall(len(done), n), account=acc_id)
     except Exception as exc:  # noqa: BLE001
@@ -1831,9 +1859,10 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
                               build_segment_prompt(plan, plan.segments[0])[:200]),
                           segment_total=len(plan.segments), segment_index=0,
                           segment_done=0, segments=[], notes=plan.notes,
-                          duration=duration)
+                          duration=duration, size=req.size, aspect_ratio=req.aspect_ratio,
+                          reference_image=ref_img)
         threading.Thread(target=_drive_long_video,
-                         args=(task["id"], plan, req, ref_img, CFG.long_video_budget),
+                         args=(task["id"], plan, req, ref_img, CFG.long_video_budget, None),
                          name="longvideo-%s" % task["id"][-8:], daemon=True).start()
         return {"id": task["id"], "task_id": task["id"], "object": "video.task",
                 "status": ST_QUEUED, "progress": 0, "duration": duration,
@@ -1936,6 +1965,66 @@ def get_video(task_id: str, _=Depends(auth)):
         if "video" not in out:
             out["video"] = {"url": vurl}
     return out
+
+
+@app.post("/v1/videos/{task_id}/resume")
+async def resume_video_task(task_id: str, _=Depends(auth)):
+    """断点续传长视频任务：跳过已完成且文件有效的分段，从失败/未完成的段落继续跑。"""
+    task = store.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+
+    seg_total = task.get("segment_total")
+    if not seg_total or seg_total <= 1:
+        raise HTTPException(400, "仅多段长视频支持断点续传")
+
+    status = task.get("status")
+    if status in (ST_RUNNING, "rendering", "processing", "merging"):
+        raise HTTPException(409, "任务正在执行中，无法重复触发续传")
+
+    prompt = task.get("prompt")
+    if not prompt:
+        raise HTTPException(400, "任务缺少原始提示词，无法重新规划分段")
+
+    duration = int(task.get("duration") or 240)
+    plan = plan_segments(prompt, duration,
+                         cap=CFG.video_seg_cap or MUSE_MAX_SINGLE_SECONDS,
+                         max_segments=CFG.video_max_segments)
+    if not plan.segments:
+        raise HTTPException(400, "剧本重新分段失败：" + "；".join(plan.notes))
+
+    existing_segments = task.get("segments") or []
+    # 模拟构造请求参数对象
+    ref_img = task.get("reference_image") or task.get("image")
+    req = VideoRequest(
+        prompt=prompt,
+        duration=duration,
+        size=task.get("size"),
+        aspect_ratio=task.get("aspect_ratio"),
+        reference_image=ref_img
+    )
+
+    store.update_task(task_id, status=ST_QUEUED, stage="queued", error=None,
+                      notes=list(plan.notes) + ["已从断点恢复执行"])
+
+    threading.Thread(
+        target=_drive_long_video,
+        args=(task_id, plan, req, ref_img, CFG.long_video_budget, existing_segments),
+        name="longvideo-resume-%s" % task_id[-8:],
+        daemon=True
+    ).start()
+
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "object": "video.task",
+        "status": ST_QUEUED,
+        "resumed": True,
+        "segment_total": len(plan.segments),
+        "existing_segments_count": len(existing_segments),
+        "notes": plan.notes,
+        "message": f"任务已触发断点续传，将复用 {len(existing_segments)} 个已有检查点分段"
+    }
 
 
 # ------------------------- 对话（OpenAI 兼容） -------------------------

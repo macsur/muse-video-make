@@ -289,6 +289,55 @@ def scenario_startup(module):
           len(module.store.get_task(t2["id"])["segments"]) == 2)
 
 
+def scenario_resume(module):
+    """断点续传：模拟前 2 段已生成并落盘，后续重试仅生成第 3~6 段，最终合成。"""
+    print("场景 8：长视频断点续传")
+    media = _fixture_media(module, 12)
+    calls = []
+
+    def generation(prompt, kind, timeout, **kw):
+        calls.append(prompt)
+        return media[len(calls) - 1], "fixture-account"
+
+    module._run_generation = generation
+    merge_path = os.path.join(module.CFG.media_dir, "merged_resume.mp4")
+    module.merge_segments = lambda paths, **kw: {
+        "ok": True, "path": merge_path, "mode": "copy", "seconds": SAMPLE_SECONDS}
+    Path(merge_path).write_bytes(b"x" * 128)
+
+    # 1. 模拟一个失败的长视频任务，前 2 段文件完好落盘
+    t = module.store.create_task("video", SAMPLE)
+    seg1_file = Path(module.CFG.media_dir) / "seg_exist_01.mp4"
+    seg1_file.write_bytes(b"data" * 512)
+    seg2_file = Path(module.CFG.media_dir) / "seg_exist_02.mp4"
+    seg2_file.write_bytes(b"data" * 512)
+
+    fake_segments = [
+        {"index": 1, "t_start": 0, "t_end": 18, "seconds": 18, "requested_duration": 30,
+         "filename": seg1_file.name, "path": str(seg1_file), "bytes": 2048, "kind": "video"},
+        {"index": 2, "t_start": 18, "t_end": 40, "seconds": 22, "requested_duration": 30,
+         "filename": seg2_file.name, "path": str(seg2_file), "bytes": 2048, "kind": "video"},
+    ]
+    module.store.update_task(
+        t["id"], status="failed", stage="failed", duration=SAMPLE_SECONDS,
+        segment_total=6, segment_done=2, segments=fake_segments,
+        error="模拟在第 3 段发生异常"
+    )
+
+    # 2. 调用 resume 接口
+    res = asyncio.run(module.resume_video_task(t["id"], None))
+    check("resume 接口响应成功", res.get("status") == module.ST_QUEUED, str(res))
+    check("resume 记录复用了 2 段", res.get("existing_segments_count") == 2)
+
+    # 3. 等待终态
+    finished, _ = _wait_terminal(module, t["id"])
+    check("断点续传后任务最终成功", finished.get("status") == module.ST_DONE, str(finished.get("error")))
+    # 样本一共 6 段，前 2 段复用，应该只产生 4 次生成调用（第 3、4、5、6 段）
+    check("仅生成剩余的 4 个分段", len(calls) == 4, f"实际生成调用了 {len(calls)} 次")
+    check("分段总数仍为 6 段", len(finished.get("segments") or []) == 6)
+    check("最终生成合成视频", bool((finished.get("result") or {}).get("url")))
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="muse-lv-flow-") as home:
         module = _load(home)
@@ -301,6 +350,7 @@ def main():
             scenario_merge_degrade(module)
             scenario_short(module)
             scenario_startup(module)
+            scenario_resume(module)
         finally:
             module.SCHED.stop()
     print()

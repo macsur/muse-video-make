@@ -337,18 +337,33 @@
     }
     if(t.status==='completed'){
       // 段落都生成成功了，只是没能合成
+      var resumeBtn = (t.segmentTotal && t.segmentTotal > 1)
+        ? '<div style="margin-top:12px"><button class="btn btn-primary" onclick="resumeTask(\''+esc(t.id)+'\')">🎬 重新合成完整视频</button></div>'
+        : '';
       area.innerHTML='<div class="prog-head"><span class="prog-status" style="color:var(--warn)">'+
         '分段已生成，未合成</span></div>'+
         '<div class="prog-note err">'+
         esc(t.mergeReason||'合成未完成，下面是各分段，可单独下载后自行拼接')+'</div>'+
+        resumeBtn+
         notesHtml(t)+segmentsHtml(t)+
         '<div class="prog-note" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">'+
         esc(t.prompt||'')+'</div>';
       return;
     }
     if(t.status==='failed'){
+      var isLong = !!(t.segmentTotal && t.segmentTotal > 1);
+      var resumeBtn = '';
+      if(isLong){
+        var nextSeg = (t.segmentDone || 0) + 1;
+        var btnText = (t.segmentDone > 0)
+          ? ('🔄 从第 ' + nextSeg + ' 段断点续传（已保住 ' + t.segmentDone + '/' + t.segmentTotal + ' 段）')
+          : '🔄 重新尝试生成该长视频';
+        resumeBtn = '<div style="margin-top:12px;margin-bottom:8px">' +
+          '<button class="btn btn-primary" style="width:100%" onclick="resumeTask(\''+esc(t.id)+'\')">'+btnText+'</button></div>';
+      }
       area.innerHTML='<div class="prog-head"><span class="prog-status" style="color:var(--err)">生成失败</span></div>'+
         '<div class="prog-note err">'+esc(t.err||'未知错误')+'</div>'+
+        resumeBtn+
         notesHtml(t)+segmentsHtml(t)+
         '<div class="prog-note" style="margin-top:12px">'+esc(t.prompt||'')+'</div>';
       return;
@@ -410,6 +425,25 @@
     if(b&&!btn.querySelector('.spinner')){
       var sp=document.createElement('span'); sp.className='spinner'; btn.insertBefore(sp,$('genBtnText'));
     } else if(!b){ var ex=btn.querySelector('.spinner'); if(ex) ex.remove(); }
+  }
+
+  function resumeTask(id){
+    if(state.busy){ toast('当前有正在生成的任务，请稍后'); return; }
+    if(!state.base||!state.key){ toast('请先在下方填写接口地址与 API Key'); return; }
+    setBusy(true);
+    fetch(api('/v1/videos/'+id+'/resume'),{method:'POST',headers:headers()})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,status:r.status,body:j}; }); })
+      .then(function(res){
+        if(!res.ok){
+          var msg=(res.body&&(res.body.error&&(res.body.error.message||res.body.error)||res.body.detail))||('HTTP '+res.status);
+          throw new Error(typeof msg==='string'?msg:JSON.stringify(msg));
+        }
+        state.taskId=id;
+        updTask(id, {status:'queued', err:''});
+        toast(res.body.message || '已触发断点续传…');
+        startPolling(id);
+      })
+      .catch(function(e){ setBusy(false); toast('续传失败：'+e.message); });
   }
 
   function generate(){

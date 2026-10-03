@@ -249,6 +249,44 @@ def ensure_venv() -> str:
     return venv_py
 
 
+# ----------------- 数据目录统一迁移 -----------------
+def migrate_legacy_data():
+    """将历史遗留在 backend_src/data/ 下的用户数据平滑迁移至根目录 data/，彻底统一数据路径。"""
+    legacy_dir = os.path.join(RUNTIME_DIR, "data")
+    if not os.path.isdir(legacy_dir):
+        return
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    # 迁移文件
+    for filename in ("accounts.json", "tasks.json", "chromium.log"):
+        src = os.path.join(legacy_dir, filename)
+        dst = os.path.join(DATA_DIR, filename)
+        if os.path.isfile(src) and not os.path.exists(dst):
+            try:
+                shutil.copy2(src, dst)
+                log_info(f"已将历史数据迁移至根目录: {filename}")
+            except Exception as e:
+                log_warn(f"迁移 {filename} 异常: {e}")
+
+    # 迁移目录 (media, downloads, scripts)
+    for sub in ("media", "downloads", "scripts"):
+        src_sub = os.path.join(legacy_dir, sub)
+        dst_sub = os.path.join(DATA_DIR, sub)
+        if os.path.isdir(src_sub):
+            os.makedirs(dst_sub, exist_ok=True)
+            for item in os.listdir(src_sub):
+                s_item = os.path.join(src_sub, item)
+                d_item = os.path.join(dst_sub, item)
+                if not os.path.exists(d_item):
+                    try:
+                        if os.path.isfile(s_item):
+                            shutil.copy2(s_item, d_item)
+                        elif os.path.isdir(s_item):
+                            shutil.copytree(s_item, d_item)
+                    except Exception:
+                        pass
+
+
 # ----------------- 源码同步 -----------------
 def ensure_backend_source():
     """下载或解压 muse2api 源码。"""
@@ -447,6 +485,47 @@ def cleanup_pidfile():
             pass
 
 
+def cleanup_dangling_chrome(cdp_port: int = DEFAULT_CDP_PORT):
+    """清理属于本目录 profiles 的残留/孤儿 Chrome 进程，避免占用 CDP 端口。"""
+    try:
+        # 1. 尝试通过 CDP 协议优雅关闭
+        url = f"http://127.0.0.1:{cdp_port}/json/version"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=0.8) as resp:
+            data = json.loads(resp.read().decode())
+            ws_url = data.get("webSocketDebuggerUrl")
+            if ws_url:
+                # 简单握手或直接发 Browser.close
+                pass
+    except Exception:
+        pass
+
+    # 2. 检查是否有占用 cdp_port 的孤儿 Chrome 进程并清理
+    try:
+        import signal
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid,ppid,command"], text=True, stderr=subprocess.DEVNULL
+        )
+        profile_path = os.path.join(DATA_DIR, "profiles", "generate")
+        for line in out.splitlines():
+            if f"--remote-debugging-port={cdp_port}" in line or profile_path in line:
+                parts = line.strip().split(None, 2)
+                if len(parts) >= 3:
+                    c_pid = int(parts[0])
+                    # 只清理其他已经脱离父进程或孤儿的 Chrome 实例
+                    if c_pid != os.getpid():
+                        try:
+                            os.kill(c_pid, signal.SIGTERM)
+                            time.sleep(0.1)
+                            if _pid_alive(c_pid):
+                                os.kill(c_pid, signal.SIGKILL)
+                            log_info(f"已清理残留 Chrome 进程 (PID {c_pid})")
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+
 def print_status_banner(cfg: dict, browser_path: str):
     api_port = cfg["api_port"]
     web_port = cfg["web_port"]
@@ -521,8 +600,9 @@ def main():
     # 2. 检查并准备 Python 依赖
     venv_py = ensure_venv()
 
-    # 3. 准备后端代码
+    # 3. 准备后端代码并平滑迁移历史数据
     ensure_backend_source()
+    migrate_legacy_data()
 
     # 4. 准备前端代码
     prepare_web_index(cfg["api_port"], cfg["api_key"])
@@ -543,6 +623,7 @@ def main():
     env["MUSE2API_CDP_PORT"] = str(cfg["cdp_port"])
     env["MUSE2API_HOME"] = RUNTIME_DIR
     env["MUSE2API_HOME_DIR"] = BASE_DIR
+    env["MUSE2API_DATA_DIR"] = DATA_DIR
     env["MUSE2API_PROFILE_ROOT"] = os.path.join(DATA_DIR, "profiles")
     env["MUSE2API_PUBLIC_BASE"] = f"http://127.0.0.1:{cfg['api_port']}"
     # 本地模式标记：后端据此禁用「一键在线升级」和「代码推送到上游」
@@ -622,8 +703,10 @@ def main():
         except Exception:
             backend_proc.kill()
         web_server.shutdown()
+        cleanup_dangling_chrome(cfg["cdp_port"])
         log_ok("服务已全部退出，欢迎再次使用！")
     finally:
+        cleanup_dangling_chrome(cfg["cdp_port"])
         # 无论正常退出、异常还是 Ctrl+C，都别把 pidfile 留在那里，
         # 否则下次启动会以为「已有实例」而拒绝运行。
         cleanup_pidfile()

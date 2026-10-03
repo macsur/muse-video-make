@@ -159,6 +159,9 @@ class Config:
 
     @property
     def data_dir(self) -> str:
+        custom = _env("MUSE2API_DATA_DIR", "").strip()
+        if custom:
+            return custom
         return os.path.join(self.base_dir, "data")
 
     @property

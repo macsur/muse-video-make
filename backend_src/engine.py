@@ -110,15 +110,40 @@ class MuseEngine:
     def stop(self):
         for c in (self.page, self.browser):
             if c:
-                c.close()
+                try:
+                    c.close()
+                except Exception:
+                    pass
         self.page = self.browser = None
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
-                self.proc.wait(timeout=10)
-            except Exception:  # noqa: BLE001
-                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
         self.proc = None
+        # 若仍有孤儿 Chrome 进程占用此 CDP 端口，强行释放，避免后续启动冲突
+        try:
+            self._force_cleanup_cdp_port()
+        except Exception:
+            pass
+
+    def _force_cleanup_cdp_port(self):
+        """若 CDP 端口仍被 Chrome 孤儿占用，尝试安全关闭或释放端口。"""
+        import requests
+        try:
+            requests.get(f"http://127.0.0.1:{self.cfg.cdp_port}/json/version", timeout=1)
+            # 通过 CDP 协议命令让浏览器自身优雅退出
+            v = http_json(self._debug_url(), timeout=1)
+            if v and "webSocketDebuggerUrl" in v:
+                c = CDP(v["webSocketDebuggerUrl"], timeout=2)
+                c.send("Browser.close")
+                c.close()
+        except Exception:
+            pass
 
     # ---------------- 页面 ----------------
     def _open_page(self):
