@@ -18,6 +18,14 @@
 
 ---
 
+## 🖥 界面长这样
+
+左边填画面描述、时长、画幅和首帧图，右边是当前任务和历史记录。
+
+![Muse 视频工作台界面](https://raw.githubusercontent.com/macsur/muse-video-make/main/素材库/工作台界面.png)
+
+---
+
 ## 一分钟跑起来
 
 ### 第 1 步：下载
