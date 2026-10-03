@@ -592,6 +592,18 @@ def strip_text_overlays(text: str) -> str:
 _MIN_VISUAL_CHARS = 80
 
 
+# build_segment_prompt 产出的段头。调用方若还要把段体交给 build_video_prompt
+# 再包一层画幅/时长声明，**必须先剥掉它**，否则提示词里会同时出现两个互相
+# 矛盾的时长：
+#     外层「时长严格为 10 秒」（= seg.request_duration，向 muse.ai 请求的档位）
+#     内层「时长严格为  8 秒」（= seg.seconds，剧本时间码算出来的）
+# 8 秒的剧本镜头向上取档成 10 秒是设计如此（muse.ai 只支持 5/10/30），
+# 但模型读到的就是一条自相矛盾的指令。
+SEG_HEAD_RE = re.compile(
+    r"^\s*全新文生视频创作[^\n]*?时长严格为\s*\d+\s*秒\s*[）)\s]*[。．.]?\s*"
+)
+
+
 def build_segment_prompt(plan: SegmentPlan, seg: Segment) -> str:
     """组装单段的实际提示词：生成指令 + 角色基底 + 段体。
 

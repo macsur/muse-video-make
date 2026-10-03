@@ -777,13 +777,26 @@ class MuseEngine:
             # 所以连接不通时要如实报连接故障，不要把「抓不到」说成「没生成」。
             #
             # 但**不能一见 Connecting 字样就立刻抛**：正常生成过程中页面偶尔
-            # 也会闪「正在连接」，而且附件可能马上就会出现（test_vm_wait 的桩就是
+            # 也会闪「正在连接」，而且附件可能马上就要出现（test_vm_wait 的桩就是
             # 这种情形：tail 恒为 Connecting，但 20 秒后附件正常出现）。
-            # 这里只做「已经耗掉大段时间、一个附件都没有、助手气泡也没增长」的
-            # 兜底诊断 —— 到这一步还没任何产出，才更有把握是连接卡死。
+            #
+            # 阈值曾是写死的 45 秒，那是照着 test_vm_wait 的桩（20 秒出附件）
+            # 定的，**放到真实链路上就是个致命误杀**：实测单段生成要 226~371 秒
+            # （task_13756632c5a14e91b6eb 用了 245.8 秒），这几十秒里页面一直
+            # 显示「正在连接」、附件数为 0、助手气泡也还没长出来 —— 三个条件在
+            # 正常生成期间是**同时成立**的。于是 45 秒一到就抛「连接故障」，
+            # 长视频第一段 100% 死在 45 秒处（task_cb3315b46cb1427c9202，
+            # task_e27794ec41b64bedbad6 均如此），而那会儿模型才刚开始干活。
+            #
+            # 这个守卫真正的职责是**诊断精度**，不是抢跑：把「反正要超时」
+            # 换成一句更准的原因。所以它必须晚到 —— 只在预算快烧完、确实要超时
+            # 的那一刻才提前收工，正常慢的生成绝不能被它砍掉。
             conn_stuck = re.search(r"Connecting\.\.\.|正在连接|连接中|Loading\.\.\.|加载中", tail)
             assistant_grew = (st.get("cnt") or 0) > base_agent_cnt
-            if conn_stuck and not atts and not assistant_grew and elapsed > 45.0:
+            # 下限 240s 覆盖实测的单段耗时上限（371s 里 226 是常态），
+            # 再按预算的 80% 兜底，timeout 调小时也不会退化成早杀。
+            stuck_threshold = max(240.0, timeout * 0.8)
+            if conn_stuck and not atts and not assistant_grew and elapsed > stuck_threshold:
                 raise MuseGenerationError(
                     "muse.ai 页面长时间停在「正在连接」且无任何产出，判断为页面/WebSocket "
                     "连接故障（不是模型没生成）。建议重试，或检查账号会话是否有效。")

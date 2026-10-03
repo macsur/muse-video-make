@@ -47,7 +47,8 @@ from pydantic import BaseModel, Field
 from config import CFG
 from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError
 from longvideo import (MUSE_MAX_SINGLE_SECONDS, MUSE_SINGLE_DURATIONS,
-                       build_segment_prompt, merge_segments, plan_segments)
+                       SEG_HEAD_RE, build_segment_prompt, merge_segments,
+                       plan_segments)
 from scheduler import ST_DONE, ST_FAILED, ST_QUEUED, ST_RUNNING, ST_TIMEOUT, Scheduler
 from store import Store, account_expiry, min_expiry
 
@@ -1705,6 +1706,11 @@ def _drive_long_video(task_id: str, plan, req: VideoRequest,
                     f"（已完成 {len(done)} 段，剩余 {n - len(done)} 段未生成）")
 
             body = build_segment_prompt(plan, seg)
+            # 剥掉段体自带的段头：紧接着的 build_video_prompt 会再包一层
+            # 画幅 + 时长声明。两层都留着的话提示词会同时写着「时长严格为 10 秒」
+            # 和「时长严格为 8 秒」（前者是向 muse.ai 请求的档位，后者是剧本
+            # 时间码），模型读到的是一条自相矛盾的指令。
+            body = SEG_HEAD_RE.sub("", body, count=1).lstrip()
             # 每段按内容时长向上取档（5/10/30），请求里不能还写 240
             seg_req = req.model_copy(update={"duration": seg.request_duration,
                                              "timeout": CFG.video_timeout})
